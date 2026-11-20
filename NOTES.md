@@ -72,3 +72,20 @@ Writing saves needs no compressor at all (stored Kraken blocks).
   wgs writes were run via a WMI-spawned process (Win32_Process.Create). Normal users running the tool don't hit this.
 - Both test saves were removed afterwards; all remaining Game Pass saves were byte-identical to the backup in
   backups/wgs-2026-11-20-before-test.
+
+## The app (2026-11-20)
+
+- `osc/app.py` opens the window (pywebview, WebView2). The screen is `osc/ui/` and talks to `osc/library.py`
+  through four calls: `load`, `thumb`, `convert`, `open_backups`.
+- The window is served over a local http server, not file://, or WebGL refuses the fire's pictures.
+- `python -m osc.app --serve 8770` serves the same screen for a browser at `/?dev` (for testing and screenshots).
+- `dist\NickenosOblivionConverter.exe --selftest out.json` opens, writes what the screen shows, and closes.
+- Testing never touches the real save folders: point `OSC_OG_SAVES`, `OSC_WGS`, `OSC_STEAM_REM` and `OSC_BACKUPS`
+  at copies. With `OSC_WGS` / `OSC_STEAM_REM` set, the "close Remastered first" check is skipped.
+- Original Oblivion keeps saves in `Documents\My Games\Oblivion\Saves` on Steam, GOG and Game Pass alike
+  (Wrye Bash wiki, Microsoft Store Games page), so one folder covers all three.
+- The same original save converted twice gets the next free "Save N" name. Each converted save is its own
+  character in Remastered (fresh CharacterId).
+- A save converted to the original game is stamped with the current time, so it lists as the newest.
+- The gate sign and fire canvas are children of the Convert button's wrapper and are sized from the button's own
+  box. Do not go back to placing them from screen coordinates (they drifted during the load animation).
