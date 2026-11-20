@@ -142,6 +142,9 @@ void main(){
   const IDLE = { heat: .32, gate: 0 };
   const cur = { ...IDLE }, tgt = { ...IDLE };
   let box = null, t0 = performance.now(), last = t0;
+  // The fire needs about 60 pictures a second. Screens can ask for 240 or more, so frames in between
+  // are skipped, and it runs at half speed while another window (a game) is in front.
+  const GAP_FRONT = 1000 / 60 - 2, GAP_BEHIND = 1000 / 30 - 2;
 
   function draw(now = performance.now()) {
     if (!box) return;
@@ -155,13 +158,14 @@ void main(){
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
   function frame(now) {
+    requestAnimationFrame(frame);
+    if (document.hidden || now - last < (document.hasFocus() ? GAP_FRONT : GAP_BEHIND)) return;
     const dt = Math.min(.05, (now - last) / 1000); last = now;
     for (const k of ['heat', 'gate']) {
       const rate = tgt[k] > cur[k] ? (k === 'gate' ? 2.6 : 5) : 1.3;   // catches fast, dies down slowly
       cur[k] += (tgt[k] - cur[k]) * (1 - Math.exp(-dt * rate));
     }
     draw(now);
-    requestAnimationFrame(frame);
   }
 
   api.place = b => {

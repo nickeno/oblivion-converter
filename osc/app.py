@@ -21,7 +21,10 @@ def _log(text: str):
     try:
         d = library.backups_dir().parent
         d.mkdir(parents=True, exist_ok=True)
-        with open(d / 'errors.log', 'a', encoding='utf-8') as f:
+        log = d / 'errors.log'
+        if log.is_file() and log.stat().st_size > 1_000_000:        # keep it small: only the newest part
+            log.write_bytes(log.read_bytes()[-200_000:])
+        with open(log, 'a', encoding='utf-8') as f:
             f.write(text.rstrip() + '\n\n')
     except Exception:
         pass

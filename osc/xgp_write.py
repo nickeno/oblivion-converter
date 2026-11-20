@@ -11,8 +11,10 @@ load menu reads, so the new save is added there too. That blob is rewritten in p
 
 The game must be closed while this runs. Back up the wgs folder first.
 """
+import copy
 import datetime
 import os
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +98,23 @@ class ImportError_(Exception):
     pass
 
 
+NO_TEMPLATE = 'Save once in Oblivion Remastered first, so there is a save to copy settings from.'
+
+
+def write_atomic(path: Path, data: bytes):
+    """Write next to the file, then swap it in, so a crash never leaves half a file behind."""
+    tmp = path.with_name(path.name + '.osc_tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 # ----------------------------------------------------------------------------- saves_meta
 def _meta_map(meta):
     mp = find_prop(meta.props, 'AllSavesDetails')
@@ -121,13 +140,24 @@ def meta_with_entry(meta_bytes: bytes, slot_name: str, details_props, base_slot:
     copied from `base_slot`'s entry, or the first manual save's."""
     meta = parse_gvas(meta_bytes)
     mp, removed, entries = _meta_map(meta)
+
+    def save_type(props):
+        t = find_prop(props, 'Type')
+        return t if t is not None and t.kind == 'enum' else None
+
     base = next((p for k, p in entries if k.s == base_slot), None) if base_slot else None
     if base is None:
-        base = next(p for k, p in entries if (t := find_prop(p, 'Type')) and t.value.s.endswith('Manual'))
-    import copy
+        base = next((p for k, p in entries if (t := save_type(p)) and t.value.s.endswith('Manual')), None)
+    if base is None:                    # only autosaves or quicksaves so far: borrow one of those
+        if not entries:
+            raise ImportError_(NO_TEMPLATE)
+        base = entries[0][1]
     new = copy.deepcopy(base)
     by_name = {p.name.s: p for p in details_props}
     new = [copy.deepcopy(by_name[p.name.s]) if p.name.s in by_name else p for p in new]
+    t = save_type(new)
+    if t is not None and not t.value.s.endswith('Manual'):      # the new one is a normal save
+        t.value.s = t.value.s.rsplit('::', 1)[0] + '::Manual'
     entries = [(k, p) for k, p in entries if k.s != slot_name]
     entries.insert(0, (FStr(slot_name), new))
     _store_meta_map(mp, removed, entries)
@@ -156,34 +186,46 @@ def import_save(wgs_user_dir: Path, sav_bytes: bytes, slot_name: str, details_pr
         raise ImportError_(f'A save named {name} already exists')
     now = _now_filetime()
 
-    # 1. saves_meta (in place)
-    meta_e = next(e for e in idx.entries if e.name == 'saves_meta')
+    # 1. saves_meta: worked out first, so a save list we can't read stops this before anything is written
+    meta_e = next((e for e in idx.entries if e.name == 'saves_meta'), None)
+    if meta_e is None:
+        raise ImportError_(NO_TEMPLATE)
     meta_blob = _blob_path(wgs_user_dir, meta_e)
-    new_meta = meta_with_entry(meta_blob.read_bytes(), slot_name, details_props)
+    old_meta = meta_blob.read_bytes()
+    new_meta = meta_with_entry(old_meta, slot_name, details_props)
 
-    # 2. new container folder + container.1 + data blob
+    # 2. new container folder + container.1 + data blob (nothing points at it until the index does)
     folder_guid, file_guid = uuid.uuid4(), uuid.uuid4()
     folder = wgs_user_dir / folder_guid.hex.upper()
-    folder.mkdir()
-    (folder / file_guid.hex.upper()).write_bytes(sav_bytes)
-    w = Writer()
-    w.u32(4); w.u32(1)
-    w.bytes('Data'.encode('utf-16-le').ljust(128, b'\0'))
-    w.bytes(b'\0' * 16)                 # no cloud copy yet
-    w.bytes(file_guid.bytes_le)
-    (folder / 'container.1').write_bytes(w.out())
+    try:
+        folder.mkdir()
+        (folder / file_guid.hex.upper()).write_bytes(sav_bytes)
+        w = Writer()
+        w.u32(4); w.u32(1)
+        w.bytes('Data'.encode('utf-16-le').ljust(128, b'\0'))
+        w.bytes(b'\0' * 16)                 # no cloud copy yet
+        w.bytes(file_guid.bytes_le)
+        (folder / 'container.1').write_bytes(w.out())
 
-    meta_blob.write_bytes(new_meta)
-
-    # 3. index
-    entry = IndexEntry(name, name, '', 1, CONTAINER_CREATED, folder_guid.bytes_le, now, 0, len(sav_bytes))
-    place = next((i for i, e in enumerate(idx.entries) if e.name > name), len(idx.entries))   # ordinal order
-    idx.entries.insert(place, entry)
-    meta_e.mtime, meta_e.size = now, len(new_meta)
-    if meta_e.state == 1:
-        meta_e.state = CONTAINER_CHANGED
-    idx.mtime, idx.state = now, INDEX_CHANGED
-    tmp = index_path.with_name('containers.index.osc_tmp')
-    tmp.write_bytes(write_index(idx))
-    os.replace(tmp, index_path)
+        # 3. save list, then the index; if the index can't be written the old save list goes back
+        entry = IndexEntry(name, name, '', 1, CONTAINER_CREATED, folder_guid.bytes_le, now, 0, len(sav_bytes))
+        place = next((i for i, e in enumerate(idx.entries) if e.name > name), len(idx.entries))   # ordinal order
+        idx.entries.insert(place, entry)
+        meta_e.mtime, meta_e.size = now, len(new_meta)
+        if meta_e.state == 1:
+            meta_e.state = CONTAINER_CHANGED
+        idx.mtime, idx.state = now, INDEX_CHANGED
+        new_index = write_index(idx)
+        write_atomic(meta_blob, new_meta)
+        try:
+            write_atomic(index_path, new_index)
+        except BaseException:
+            try:
+                write_atomic(meta_blob, old_meta)
+            except OSError:
+                pass
+            raise
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
     return name

@@ -10,8 +10,6 @@ import io
 import os
 import re
 import struct
-import subprocess
-import time
 import uuid
 import zipfile
 from ctypes import wintypes
@@ -29,6 +27,8 @@ from .remastered import open_save
 REMASTERED_EXES = ('OblivionRemastered-WinGDK-Shipping.exe', 'OblivionRemastered-Win64-Shipping.exe')
 APP_DIR_NAME = "Nickeno's Oblivion Converter"
 KEEP_BACKUPS = 20          # newest backups kept per store; each is a zip of the whole save folder
+KEEP_BACKUPS_MIN = 3       # always kept, also when they are big
+BACKUPS_MAX_BYTES = 2 * 1024 ** 3      # older ones go once a store's backups pass this
 
 
 class UserError(Exception):
@@ -72,13 +72,37 @@ def backups_dir() -> Path:
     return Path(os.environ.get('OSC_BACKUPS') or documents_dir() / APP_DIR_NAME / 'Backups')
 
 
+class _ProcessEntry(ctypes.Structure):          # PROCESSENTRY32W
+    _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD), ('th32ProcessID', wintypes.DWORD),
+                ('th32DefaultHeapID', ctypes.c_size_t), ('th32ModuleID', wintypes.DWORD),
+                ('cntThreads', wintypes.DWORD), ('th32ParentProcessID', wintypes.DWORD),
+                ('pcPriClassBase', wintypes.LONG), ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260)]
+
+
 def running_exes() -> set:
+    """Lowercase names of the running programs, asked from Windows directly (no helper program is started)."""
+    out = set()
     try:
-        out = subprocess.run(['tasklist', '/fo', 'csv', '/nh'], capture_output=True, text=True,
-                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout
-        return {line.split('","')[0].strip('"').lower() for line in out.splitlines() if line}
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.Process32FirstW.argtypes = k32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry)]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        snap = k32.CreateToolhelp32Snapshot(2, 0)               # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return out
+        try:
+            pe = _ProcessEntry()
+            pe.dwSize = ctypes.sizeof(_ProcessEntry)
+            more = k32.Process32FirstW(snap, ctypes.byref(pe))
+            while more:
+                out.add(pe.szExeFile.lower())
+                more = k32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            k32.CloseHandle(snap)
     except Exception:
-        return set()
+        pass
+    return out
 
 
 def remastered_running() -> bool:
@@ -283,10 +307,17 @@ def list_remastered() -> list:
     return out
 
 
+def _file_in(folder: Path, name: str) -> Path:
+    """folder/name, only when `name` is a plain file name (an id can't point outside the save folder)."""
+    if not name or name in ('.', '..') or Path(name).name != name or ':' in name:
+        raise UserError('That save is gone. Refresh the list.')
+    return folder / name
+
+
 def _rem_bytes(entry_id: str) -> bytes:
     kind, rest = entry_id.split(':', 1)
     if kind == 'steam':
-        return (steam_rem_dir() / rest).read_bytes()
+        return _file_in(steam_rem_dir(), rest).read_bytes()
     wgs_name, name = rest.split(':', 1)
     for wgs in xbox_dirs():
         if wgs.name == wgs_name:
@@ -330,7 +361,7 @@ def thumbnail(entry_id: str) -> Optional[str]:
     """data: URL of the save's picture. Not cached here: autosaves and quicksaves are overwritten in place."""
     try:
         if entry_id.startswith('og:'):
-            jpg = _og_thumbnail(og_saves_dir() / entry_id[3:])
+            jpg = _og_thumbnail(_file_in(og_saves_dir(), entry_id[3:]))
         else:
             jpg = _rem_thumbnail(entry_id)
     except Exception:
@@ -377,9 +408,7 @@ def to_og(entry_id: str, target_dir: Optional[str] = None) -> dict:
     name = (f'Save {n} - {h["name"]} - {h["location"]}, Level {h["level"]}, '
             f'Playing Time {_hms(h["ticks"] // 1000)}.ess')
     path = out_dir / _safe_filename(name)
-    tmp = path.with_suffix('.ess.tmp')
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    xgp_write.write_atomic(path, data)
     return {'id': 'og:' + path.name, 'path': str(path), 'title': f'Save {n}', 'where': 'Original Oblivion > Load'}
 
 
@@ -395,9 +424,12 @@ def _backup(src: Path, label: str) -> Path:
                     z.write(f, f.relative_to(src.parent))
         else:
             z.write(src, src.name)
-    for old in sorted(bdir.glob(f'{label}_*.zip'), reverse=True)[KEEP_BACKUPS:]:   # names sort by date
+    total = 0
+    for i, old in enumerate(sorted(bdir.glob(f'{label}_*.zip'), reverse=True)):    # names sort by date
         try:
-            old.unlink()
+            total += old.stat().st_size
+            if i >= KEEP_BACKUPS or (i >= KEEP_BACKUPS_MIN and total > BACKUPS_MAX_BYTES):
+                old.unlink()
         except OSError:
             pass
     return zpath
@@ -434,7 +466,7 @@ def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
     if not test_copy and remastered_running():
         raise UserError('Close Oblivion Remastered first, then try again.')
     try:
-        ess = (og_saves_dir() / entry_id[3:]).read_bytes()
+        ess = _file_in(og_saves_dir(), entry_id[3:]).read_bytes()
     except OSError:
         raise UserError('That save is gone. Refresh the list.')
 
@@ -471,15 +503,23 @@ def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
         raise UserError('Save once in Oblivion Remastered first, so there is a save to copy settings from.')
     sav, details, slot, n = build(_rem_bytes(tmpl.id), lambda s: (sd / (_safe_filename(s) + '.sav')).exists())
     path = sd / (_safe_filename(slot) + '.sav')
-    backup = _backup(sd / 'saves_meta.sav', 'Steam') if (sd / 'saves_meta.sav').is_file() else None
-    tmp = path.with_suffix('.sav.tmp')
-    tmp.write_bytes(sav)
-    os.replace(tmp, path)
     mf = sd / 'saves_meta.sav'
-    if mf.is_file():
-        new_meta = xgp_write.meta_with_entry(mf.read_bytes(), path.stem, details)
-        mtmp = mf.with_suffix('.sav.tmp')
-        mtmp.write_bytes(new_meta)
-        os.replace(mtmp, mf)
+    new_meta = backup = None
+    if mf.is_file():                    # worked out before anything is written
+        try:
+            new_meta = xgp_write.meta_with_entry(mf.read_bytes(), path.stem, details)
+        except xgp_write.ImportError_ as e:
+            raise UserError(str(e))
+        backup = _backup(mf, 'Steam')
+    xgp_write.write_atomic(path, sav)
+    if new_meta is not None:
+        try:
+            xgp_write.write_atomic(mf, new_meta)
+        except BaseException:           # no half-added save: take the new file away again
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
     return {'id': 'steam:' + path.name, 'title': f'Save {n}', 'path': str(path),
             'backup': str(backup) if backup else None, 'where': 'Oblivion Remastered > Load'}
