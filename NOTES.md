@@ -68,6 +68,18 @@ Writing saves needs no compressor at all (stored Kraken blocks).
   playtime/thumbnail correctly (LOC_FN_AnvilMagesGuild resolves). Character sheet: level 126, 1419 HP, gear intact.
 - Game Pass write: new container state 5 + empty ETag, saves_meta rewritten in place (state 2), index state 2.
   Xbox app uploaded it on launch. Deleting in-game removed it cleanly (an empty folder was left behind).
+- Since the audit fixes (0.1.3): the game itself writes a new `container.N` (N = the index entry's number, one
+  byte) and a new data file on every save, then removes the old pair. saves_meta is now written the same way:
+  new data file + `container.N+1` (cloud guid kept), and writing `containers.index` is the single step that makes
+  the game see it. Only at N = 255 it falls back to the old in-place rewrite. Readers use the index's N, never
+  the highest file. Checked in the game (2026-11-20, app code, real folder): the converted save listed, loaded
+  (lvl 126, 1419 HP) and was deleted in-game cleanly. When deleting, the game rebuilt saves_meta itself (dropped
+  6 leftover entries with no save behind them, refreshed 4 autosave entries). Xbox app upload not checked.
+- Remastered -> OG crashed OG on load for a level 12 save (access violation at Oblivion.exe+0x58139e, also with
+  0.1.2). Cause: Remastered adds extra-data entries 0x5E (16-byte id) and 0x5F (128-byte text) to placed objects
+  (records 49-51, flag 0x20). OG only knows types up to 0x5C and skips unknown ones as one byte, so it read the
+  payload as more entries. Fix: `strip_altar_extras` cuts the payloads, keeps the two type bytes (count stays
+  right). Level 4 and level 12 saves then loaded in OG with the right name, race, class, level and gear.
 - Claude desktop sandbox: new files written to %LOCALAPPDATA% from Claude's shell are hidden from Windows, so the
   wgs writes were run via a WMI-spawned process (Win32_Process.Create). Normal users running the tool don't hit this.
 - Both test saves were removed afterwards; all remaining Game Pass saves were byte-identical to the backup in
@@ -78,7 +90,10 @@ Writing saves needs no compressor at all (stored Kraken blocks).
 - `osc/app.py` opens the window (pywebview, WebView2). The screen is `osc/ui/` and talks to `osc/library.py`
   through four calls: `load`, `thumb`, `convert`, `open_backups`.
 - The window is served over a local http server, not file://, or WebGL refuses the fire's pictures.
-- `python -m osc.app --serve 8770` serves the same screen for a browser at `/?dev` (for testing and screenshots).
+- `python -m osc.app --serve 8770` serves the same screen for a browser (for testing and screenshots). It prints
+  the address to open, `/?dev=<token>`; the token is new every start and the API refuses calls without it.
+- Converts take a named Windows mutex, so two app windows or the app and the command line never write at once.
+- `tests/convert_test.py --wgs <profile> --og <.ess>` checks converting and adding saves on copies.
 - `dist\NickenosOblivionConverter.exe --selftest out.json` opens, writes what the screen shows, and closes.
 - Testing never touches the real save folders: point `OSC_OG_SAVES`, `OSC_WGS`, `OSC_STEAM_REM` and `OSC_BACKUPS`
   at copies. With `OSC_WGS` / `OSC_STEAM_REM` set, the "close Remastered first" check is skipped.
@@ -98,6 +113,12 @@ Writing saves needs no compressor at all (stored Kraken blocks).
 - Race and sex are read from the player's change record (form 0x14), right before the name: race, hair, eyes
   (4 bytes each, indexes into the save's form id list), hair length (4), hair colour (4), sex (1), then the name.
   `ess.player_look`. Checked on 62 OG saves and 20 Remastered saves.
-- A real Remastered save has the text key (`UI_UserInputText_...`) as the name in that record. A converted save
-  still has the old plain name there, so it is never trusted as a face template.
+- A real Remastered save has the text key (`UI_UserInputText_...`) as the name in that record. Remastered shows a
+  plain name there as `[NL]name` on the character sheet (seen in game, 2026-11-20). So a converted save gets the
+  key in its record when its borrowed face fits (same race and sex); then it is a valid face template too. When the
+  face doesn't fit, the plain name stays (and `[NL]` shows), so that save is never trusted as a face template.
+  Seen in game after the fix: the character sheet reads the plain name, no `[NL]`.
+- Original Oblivion reads the mouse and keys through DirectInput, so normal automated clicks do nothing. Relative
+  mouse moves and scancode keys sent with SendInput work (about 1.75 mouse units per screenshot pixel at 1920x1080
+  windowed).
 - Not tested in the game: what a wrong-race `Phenotype` looks like, and whether dropping it is safe.

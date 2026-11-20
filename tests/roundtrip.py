@@ -1,7 +1,8 @@
 """Read-only round-trip check over every Remastered save found (Game Pass wgs or given paths).
 
 For each save: GVAS re-serialize is byte exact, .ess re-serialize is byte exact, and sealing with stored
-Kraken blocks then re-opening gives the same inner data.
+Kraken blocks then re-opening gives the same inner data. Finding no saves counts as a failure.
+tests/convert_test.py covers converting and adding saves.
 """
 import sys
 import time
@@ -40,6 +41,9 @@ def main():
             for s in xgp.list_saves(d):
                 if s.name.startswith(('Save', 'autosave', 'quicksave')) and not s.name.startswith('Save_'):
                     items.append((s.name, s.data_file.read_bytes()))
+    if not items:
+        print('No saves found to check. Pass .sav files (copies) on the command line.')
+        return 2
     bad = 0
     for label, raw in items:
         try:

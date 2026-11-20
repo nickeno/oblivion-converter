@@ -1,7 +1,7 @@
 """Unreal Engine 5 GVAS SaveGame (tagged properties) reader/writer.
 
-Ported from ORSE's src/shared/gvas.ts (MIT, (c) 2026 ORSE contributors). Anything not understood is
-kept as raw bytes so files round-trip byte for byte.
+Ported from ORSE's src/shared/gvas.ts (MIT, Copyright (c) 2026 ORSE contributors; the full notice is in
+THIRD-PARTY.md). Anything not understood is kept as raw bytes so files round-trip byte for byte.
 """
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -15,9 +15,11 @@ class GvasError(Exception):
 
 @dataclass
 class FStr:
+    """An Unreal FString. Unreal writes one byte per letter (each byte is the letter's code, like Latin-1)
+    when every letter is plain ASCII, else UTF-16 with a negative length counted in UTF-16 units."""
     s: str
-    wide: bool = False
-    empty: bool = False   # serialized as length 0 (no terminator)
+    wide: Optional[bool] = None     # None: pick like Unreal does when written
+    empty: bool = False             # serialized as length 0 (no terminator)
 
 
 def read_fstr(r: Reader) -> FStr:
@@ -25,24 +27,29 @@ def read_fstr(r: Reader) -> FStr:
     if n == 0:
         return FStr('', False, True)
     if n < 0:
-        ln = -n
-        s = r.bytes(ln * 2)[:-2].decode('utf-16-le')
+        s = r.bytes(-n * 2)[:-2].decode('utf-16-le', 'surrogatepass')
         return FStr(s, True)
-    s = r.bytes(n)[:-1].decode('utf-8')
+    s = r.bytes(n)[:-1].decode('latin-1')
     return FStr(s, False)
 
 
 def write_fstr(w: Writer, f) -> None:
     if isinstance(f, str):
-        f = FStr(f, any(ord(c) > 0x7F for c in f))
-    if f.empty or (f.s == '' and not f.wide):
+        f = FStr(f)
+    s, wide = f.s, f.wide
+    if f.empty or (s == '' and wide is None):
         w.i32(0)
         return
-    if f.wide:
-        w.i32(-(len(f.s) + 1))
-        w.bytes(f.s.encode('utf-16-le') + b'\0\0')
+    if wide is None:
+        wide = any(ord(c) > 0x7F for c in s)
+    elif not wide and any(ord(c) > 0xFF for c in s):
+        wide = True                 # can't be one byte per letter any more
+    if wide:
+        b = s.encode('utf-16-le', 'surrogatepass')
+        w.i32(-(len(b) // 2 + 1))
+        w.bytes(b + b'\0\0')
     else:
-        b = f.s.encode('utf-8')
+        b = s.encode('latin-1')
         w.i32(len(b) + 1)
         w.bytes(b + b'\0')
 
@@ -66,6 +73,18 @@ class Prop:
     ints: Optional[list] = None
     strs: Optional[list] = None
     structs: Optional[dict] = None
+    prop_guid: Optional[bytes] = None  # the optional property GUID (a flag byte, then 16 bytes when set)
+
+
+def _read_guid_flag(r: Reader) -> Optional[bytes]:
+    return r.bytes(16) if r.u8() else None
+
+
+def _write_guid_flag(w: Writer, guid: Optional[bytes]) -> None:
+    if guid is None:
+        w.u8(0)
+    else:
+        w.u8(1); w.bytes(guid)
 
 
 @dataclass
@@ -114,30 +133,30 @@ def _read_value(r: Reader, name: FStr, typ: FStr, size: int, index: int) -> Prop
     t = typ.s
     p = Prop(name, typ, index, 'raw')
     if t == 'IntProperty':
-        r.u8(); p.kind, p.value = 'int', r.i32()
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'int', r.i32()
     elif t == 'UInt32Property':
-        r.u8(); p.kind, p.value = 'uint', r.u32()
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'uint', r.u32()
     elif t in ('Int64Property', 'UInt64Property'):
-        r.u8(); p.kind, p.value = 'int64', r.i64()
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'int64', r.i64()
     elif t == 'FloatProperty':
-        r.u8(); p.kind, p.value = 'float', r.f32()
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'float', r.f32()
     elif t == 'DoubleProperty':
-        r.u8(); p.kind, p.value = 'double', r.f64()
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'double', r.f64()
     elif t == 'BoolProperty':
-        v = r.u8(); r.u8(); p.kind, p.value = 'bool', bool(v)
+        v = r.u8(); p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'bool', bool(v)
     elif t == 'ByteProperty':
-        p.enum_name = read_fstr(r); r.u8()
+        p.enum_name = read_fstr(r); p.prop_guid = _read_guid_flag(r)
         p.kind = 'byte'
         p.value = r.u8() if p.enum_name.s == 'None' else read_fstr(r)
     elif t == 'EnumProperty':
-        p.enum_name = read_fstr(r); r.u8(); p.kind, p.value = 'enum', read_fstr(r)
+        p.enum_name = read_fstr(r); p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'enum', read_fstr(r)
     elif t in ('StrProperty', 'NameProperty', 'ObjectProperty'):
-        r.u8(); p.kind, p.value = 'str', read_fstr(r)
+        p.prop_guid = _read_guid_flag(r); p.kind, p.value = 'str', read_fstr(r)
     elif t == 'StructProperty':
         p.kind = 'struct'
         p.struct_name = read_fstr(r)
         p.guid = r.bytes(16)
-        r.u8()
+        p.prop_guid = _read_guid_flag(r)
         raw = r.bytes(size)
         sub = _try_props(raw, p.struct_name.s)
         if sub is not None:
@@ -147,7 +166,7 @@ def _read_value(r: Reader, name: FStr, typ: FStr, size: int, index: int) -> Prop
     elif t == 'ArrayProperty':
         p.kind = 'array'
         p.inner_type = read_fstr(r)
-        r.u8()
+        p.prop_guid = _read_guid_flag(r)
         start = r.pos
         count = r.u32()
         it = p.inner_type.s
@@ -167,7 +186,7 @@ def _read_value(r: Reader, name: FStr, typ: FStr, size: int, index: int) -> Prop
             sa['index'] = r.i32()
             sa['struct_name'] = read_fstr(r)
             sa['guid'] = r.bytes(16)
-            r.u8()
+            sa['prop_guid'] = _read_guid_flag(r)
             elems_end = start + size
             items, ok = [], sa['struct_name'].s not in NATIVE_STRUCTS
             for _ in range(count):
@@ -189,13 +208,13 @@ def _read_value(r: Reader, name: FStr, typ: FStr, size: int, index: int) -> Prop
             r.pos = start; p.raw = r.bytes(size)
         r.pos = start + size
     elif t == 'MapProperty':
-        h0 = r.pos; read_fstr(r); read_fstr(r); r.u8()
+        h0 = r.pos; read_fstr(r); read_fstr(r); _read_guid_flag(r)
         p.header = r.d[h0:r.pos]; p.raw = r.bytes(size)
     elif t == 'SetProperty':
-        h0 = r.pos; read_fstr(r); r.u8()
+        h0 = r.pos; read_fstr(r); _read_guid_flag(r)
         p.header = r.d[h0:r.pos]; p.raw = r.bytes(size)
-    else:  # TextProperty, SoftObjectProperty, ...: one guid-flag byte then payload
-        h0 = r.pos; r.u8()
+    else:  # TextProperty, SoftObjectProperty, ...: the guid flag (and guid) then payload
+        h0 = r.pos; _read_guid_flag(r)
         p.header = r.d[h0:r.pos]; p.raw = r.bytes(size)
     return p
 
@@ -242,36 +261,37 @@ def _write_prop(w: Writer, p: Prop) -> None:
     size_at = w.reserve(4)
     w.i32(p.index)
     k = p.kind
+    g = p.prop_guid
     if k == 'int':
-        w.u8(0); start = len(w); w.i32(p.value)
+        _write_guid_flag(w, g); start = len(w); w.i32(p.value)
     elif k == 'uint':
-        w.u8(0); start = len(w); w.u32(p.value)
+        _write_guid_flag(w, g); start = len(w); w.u32(p.value)
     elif k == 'int64':
-        w.u8(0); start = len(w); w.i64(p.value)
+        _write_guid_flag(w, g); start = len(w); w.i64(p.value)
     elif k == 'float':
-        w.u8(0); start = len(w); w.f32(p.value)
+        _write_guid_flag(w, g); start = len(w); w.f32(p.value)
     elif k == 'double':
-        w.u8(0); start = len(w); w.f64(p.value)
+        _write_guid_flag(w, g); start = len(w); w.f64(p.value)
     elif k == 'bool':
-        w.u8(1 if p.value else 0); w.u8(0); start = len(w)
+        w.u8(1 if p.value else 0); _write_guid_flag(w, g); start = len(w)
     elif k == 'byte':
-        write_fstr(w, p.enum_name); w.u8(0); start = len(w)
+        write_fstr(w, p.enum_name); _write_guid_flag(w, g); start = len(w)
         if isinstance(p.value, int):
             w.u8(p.value)
         else:
             write_fstr(w, p.value)
     elif k == 'enum':
-        write_fstr(w, p.enum_name); w.u8(0); start = len(w); write_fstr(w, p.value)
+        write_fstr(w, p.enum_name); _write_guid_flag(w, g); start = len(w); write_fstr(w, p.value)
     elif k == 'str':
-        w.u8(0); start = len(w); write_fstr(w, p.value)
+        _write_guid_flag(w, g); start = len(w); write_fstr(w, p.value)
     elif k == 'struct':
-        write_fstr(w, p.struct_name); w.bytes(p.guid); w.u8(0); start = len(w)
+        write_fstr(w, p.struct_name); w.bytes(p.guid); _write_guid_flag(w, g); start = len(w)
         if p.props is not None:
             _write_props(w, p.props)
         else:
             w.bytes(p.raw)
     elif k == 'array':
-        write_fstr(w, p.inner_type); w.u8(0); start = len(w)
+        write_fstr(w, p.inner_type); _write_guid_flag(w, g); start = len(w)
         if p.raw is not None:
             w.bytes(p.raw)
         elif p.data is not None:
@@ -289,7 +309,8 @@ def _write_prop(w: Writer, p: Prop) -> None:
             w.u32(len(sa['items']))
             write_fstr(w, sa['name']); write_fstr(w, sa['type'])
             total_at = w.reserve(4)
-            w.i32(sa['index']); write_fstr(w, sa['struct_name']); w.bytes(sa['guid']); w.u8(0)
+            w.i32(sa['index']); write_fstr(w, sa['struct_name']); w.bytes(sa['guid'])
+            _write_guid_flag(w, sa.get('prop_guid'))
             elems_start = len(w)
             for item in sa['items']:
                 _write_props(w, item)

@@ -48,18 +48,28 @@ def default_wgs_dirs():
     return out
 
 
-def read_container_files(folder: Path) -> dict:
-    cfiles = sorted(folder.glob('container.*'), key=lambda p: int(p.suffix[1:]) if p.suffix[1:].isdigit() else -1)
-    if not cfiles:
-        return {}
-    r = Reader(cfiles[-1].read_bytes())
+def container_file(folder: Path, num: int) -> Path:
+    """The container.N the index points at. The game writes a new N on every save and removes the old one,
+    so a leftover older or newer file must not be picked by mistake."""
+    p = folder / f'container.{num}'
+    if p.is_file():
+        return p
+    raise FileNotFoundError(f'{p.name} is missing in {folder.name}')
+
+
+def read_container(path: Path) -> list:
+    """[(file name, cloud guid bytes, local guid bytes)] from a container.N file."""
+    r = Reader(path.read_bytes())
     r.u32()
-    files = {}
+    out = []
     for _ in range(r.u32()):
-        name = r.bytes(128).decode('utf-16-le').split('\0', 1)[0]
-        r.bytes(16)
-        files[name] = folder / _guid_name(r.bytes(16))
-    return files
+        name = r.bytes(128).decode('utf-16-le', 'replace').split('\0', 1)[0]
+        out.append((name, r.bytes(16), r.bytes(16)))
+    return out
+
+
+def read_container_files(folder: Path, num: int) -> dict:
+    return {name: folder / _guid_name(local) for name, _cloud, local in read_container(container_file(folder, num))}
 
 
 def list_saves(wgs_user_dir: Path):
@@ -74,12 +84,14 @@ def list_saves(wgs_user_dir: Path):
     saves = []
     for _ in range(count):
         name = _wstr(r); _wstr(r); _wstr(r)
-        r.u8(); r.u32()
+        num = r.u8(); r.u32()
         folder = wgs_user_dir / _guid_name(r.bytes(16))
         mtime = r.u64(); r.u64()
         size = r.u64()
-        files = read_container_files(folder) if folder.is_dir() else {}
-        data = files.get('Data')
+        try:                    # one broken container hides only itself
+            data = read_container_files(folder, num).get('Data')
+        except Exception:
+            continue
         if data and data.is_file():
             saves.append(XgpSave(name, folder, data, size, mtime))
     return saves

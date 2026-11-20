@@ -40,13 +40,14 @@ class Writer:
 
     def __len__(self): return len(self.buf)
 
-    def u8(self, v): self.buf += struct.pack('<B', v & 0xFF)
+    # no masking: a count or length too big for its field raises instead of wrapping into a broken file
+    def u8(self, v): self.buf += struct.pack('<B', v)
     def i8(self, v): self.buf += struct.pack('<b', v)
-    def u16(self, v): self.buf += struct.pack('<H', v & 0xFFFF)
+    def u16(self, v): self.buf += struct.pack('<H', v)
     def i16(self, v): self.buf += struct.pack('<h', v)
-    def u32(self, v): self.buf += struct.pack('<I', v & 0xFFFFFFFF)
+    def u32(self, v): self.buf += struct.pack('<I', v)
     def i32(self, v): self.buf += struct.pack('<i', v)
-    def u64(self, v): self.buf += struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)
+    def u64(self, v): self.buf += struct.pack('<Q', v)
     def i64(self, v): self.buf += struct.pack('<q', v)
     def f32(self, v): self.buf += struct.pack('<f', v)
     def f64(self, v): self.buf += struct.pack('<d', v)
@@ -58,7 +59,7 @@ class Writer:
         return at
 
     def patch_i32(self, at: int, v: int): struct.pack_into('<i', self.buf, at, v)
-    def patch_u32(self, at: int, v: int): struct.pack_into('<I', self.buf, at, v & 0xFFFFFFFF)
+    def patch_u32(self, at: int, v: int): struct.pack_into('<I', self.buf, at, v)
 
     def out(self) -> bytes:
         return bytes(self.buf)

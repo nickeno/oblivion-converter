@@ -28,6 +28,8 @@ def _find_dll() -> Path:
 def _lib():
     global _dll
     if _dll is None:
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            raise OSError('ooz.dll is 64-bit (x64): run this with 64-bit Python')
         _dll = ctypes.CDLL(str(_find_dll()))
         _dll.Kraken_Decompress.restype = ctypes.c_int
         _dll.Kraken_Decompress.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
@@ -37,7 +39,10 @@ def _lib():
 def decompress(src: bytes, raw_len: int) -> bytes:
     if src[:2] == KRAKEN_STORED_HEADER and len(src) == raw_len + 2 and raw_len <= MAX_BLOCK:
         return bytes(src[2:])   # fast path for our own stored blocks
-    dst = ctypes.create_string_buffer(raw_len + 64)
+    # only Kraken streams go to the native decoder (saves use nothing else)
+    if len(src) < 2 or (src[0] & 0x3F) != 0x0C or (src[1] & 0x7F) != 6 or not 0 <= raw_len <= 0x1000000:
+        raise ValueError('not an Oodle Kraken stream')
+    dst = ctypes.create_string_buffer(raw_len + 64)     # the decoder may write up to 64 bytes past the end
     n = _lib().Kraken_Decompress(bytes(src), len(src), dst, raw_len)
     if n != raw_len:
         raise ValueError(f'Oodle decompress failed ({n} != {raw_len})')

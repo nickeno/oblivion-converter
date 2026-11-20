@@ -19,6 +19,7 @@
   // ------------------------------------------------------------ the converter behind the window
   // In the app this is pywebview's bridge. With ?dev in the address it is the small test server.
   const DEV = new URLSearchParams(location.search).has('dev');
+  const DEV_TOKEN = new URLSearchParams(location.search).get('dev') || '';    // printed by the test server
   const bridge = DEV ? Promise.resolve() : new Promise(res => {
     if (window.pywebview && window.pywebview.api && window.pywebview.api.load) res();
     else addEventListener('pywebviewready', () => res(), { once: true });
@@ -27,7 +28,7 @@
     await bridge;
     if (!DEV) return window.pywebview.api[name](...args);
     const r = await fetch('/api/' + name, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-OSC': '1' }, body: JSON.stringify(args),
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-OSC': DEV_TOKEN }, body: JSON.stringify(args),
     });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
@@ -35,12 +36,15 @@
 
   // ------------------------------------------------------------ data
   const groups = { og: [], rem: [] };
-  const state = { group: { og: null, rem: null }, sel: null, busy: false, loaded: false, status: null };
+  const state = { group: { og: null, rem: null }, sel: null, busy: false, loaded: false, status: null,
+    error: null, swapping: 0 };
   const lists = { og: $('#list-og'), rem: $('#list-rem') };
   const panels = { og: $('.panel[data-game="og"]'), rem: $('.panel[data-game="rem"]') };
   const go = $('#go');
   const sig = list => list.map(g => g.key + '=' + g.saves.map(s => s.id + '@' + s.saved_at).join(',')).join('|');
-  const mixed = () => new Set(groups.rem.map(g => g.store)).size > 1;
+  // more than one Remastered save folder (Steam and Game Pass, or two Game Pass profiles): say which is which
+  const mixed = () => new Set(groups.rem.map(g => g.target)).size > 1;
+  const storeLabel = g => g.store_label || STORE[g.store] || '';
 
   // start on the character that exists in both games, most recently played
   function startPick() {
@@ -68,6 +72,8 @@
   }
 
   // ------------------------------------------------------------ save pictures, fetched as rows scroll into view
+  // Kept for the newest PICS_MAX saves only. A picture that failed is not kept, so it is asked for again.
+  const PICS_MAX = 400;
   const pics = new Map(), waiting = new Map(), queue = [];
   let active = 0;
   const pkey = s => s.id + '@' + s.saved_at;
@@ -85,7 +91,12 @@
       const j = queue.pop();                       // newest request first: what is on screen right now
       active++;
       call('thumb', j.s.id).catch(() => null).then(u => {
-        pics.set(j.k, u || null); waiting.delete(j.k); active--;
+        if (u) {
+          pics.delete(j.k);
+          pics.set(j.k, u);
+          while (pics.size > PICS_MAX) pics.delete(pics.keys().next().value);     // the oldest goes
+        }
+        waiting.delete(j.k); active--;
         j.res(u || null);
         pump();
       });
@@ -136,6 +147,7 @@
     const b = document.createElement('button');
     b.className = 'row';
     b.setAttribute('role', 'option');
+    b.setAttribute('aria-selected', String(!!(state.sel && state.sel.save === s)));
     const u = pics.get(pkey(s)), w = when(s.saved_at);
     b.innerHTML = `<div class="thumb"><img alt=""${u ? ` class="in" src="${u}"` : ''}></div>
       <div><div class="t">${esc(s.location || 'Cyrodiil')}</div><div class="m">${esc(s.title)}<span class="m-lv">, level ${s.level}</span><span class="m-when">${w ? ', ' + w : ''}</span></div></div>
@@ -148,6 +160,7 @@
   }
   function emptyText(game) {
     const st = state.status;
+    if (state.error && !state.loaded) return ["Your saves couldn't be read", state.error];
     if (!state.loaded) return ['Looking for saves…', ''];
     if (game === 'og') {
       return st && !st.og_found
@@ -163,7 +176,7 @@
     who.hidden = !g;
     if (!g) { roll($(`#count-${game}`), '', false); return; }
     const solo = groups[game].length < 2;
-    const store = game === 'rem' && mixed() ? ` · ${STORE[g.store] || ''}` : '';
+    const store = game === 'rem' && mixed() ? ` · ${esc(storeLabel(g))}` : '';
     who.classList.toggle('solo', solo);
     who.innerHTML = `${esc(g.name)} <span class="lvl">Level ${g.saves[0].level}${store}</span>${solo ? '' : CHEV}`;
     roll($(`#count-${game}`), plural(g.saves.length), animate);
@@ -212,7 +225,10 @@
     if (!s) return;
     state.sel = { game, save: s };
     for (const g of ['og', 'rem']) {
-      $$('.row', lists[g]).forEach(r => r.classList.toggle('sel', r._save === s));
+      $$('.row', lists[g]).forEach(r => {
+        r.classList.toggle('sel', r._save === s);
+        r.setAttribute('aria-selected', String(r._save === s));
+      });
       placeHl(g, instant);
     }
     go.classList.toggle('left', game === 'rem');
@@ -223,6 +239,7 @@
   function apply(d) {
     const first = !state.loaded;
     state.loaded = true;
+    state.error = null;
     state.status = d.status;
     const sel = state.sel && { game: state.sel.game, id: state.sel.save.id };
     let changed = first;
@@ -250,16 +267,25 @@
     else { placeHl('og', true); placeHl('rem', true); }
     setHead('og', false); setHead('rem', false);
   }
-  let loading = false;
+  let loading = false, failed = false;
+  function loadFailed(text) {
+    if (!state.loaded) {
+      // the first load: the lists say so instead of staying on "Looking for saves"
+      state.error = text;
+      renderList('og'); renderList('rem');
+    }
+    if (!failed) say(text, true);            // once, not on every refresh while it keeps failing
+    failed = true;
+  }
   async function refresh() {
     if (loading || state.busy || drag) return;
     loading = true;
     try {
       const d = await call('load');
-      if (d && d.ok && !state.busy && !drag) apply(d);
-      else if (d && !d.ok && !state.loaded) say(d.error, true);
+      if (d && d.ok) { failed = false; if (!state.busy && !drag) apply(d); }
+      else loadFailed((d && d.error) || "Your saves couldn't be read. Close the app and open it again.");
     } catch (e) {
-      if (!state.loaded) say("The converter didn't start. Close the app and open it again.", true);
+      loadFailed("The converter didn't start. Close the app and open it again.");
     } finally { loading = false; }
   }
 
@@ -273,7 +299,7 @@
       const b = document.createElement('button');
       b.setAttribute('role', 'menuitem');
       if (g === state.group[game]) b.className = 'on';
-      const store = game === 'rem' && mixed() ? ` · ${STORE[g.store] || ''}` : '';
+      const store = game === 'rem' && mixed() ? ` · ${esc(storeLabel(g))}` : '';
       b.innerHTML = `<span>${esc(g.name)}</span><small>Level ${g.saves[0].level} · ${plural(g.saves.length)}${store}</small>`;
       b.addEventListener('click', () => { closeMenu(); pickGroup(game, g); });
       menu.appendChild(b);
@@ -298,8 +324,11 @@
     if (g === state.group[game] || state.busy) return;
     state.group[game] = g;
     const hadSel = state.sel && state.sel.game === game;
-    await swapList(game);
-    if (hadSel) select(game, g.saves[0], true);
+    // while the list swaps, the old character's save must not be what Convert sends
+    if (hadSel) state.sel = { game, save: g.saves[0] };
+    state.swapping++;
+    try { await swapList(game); } finally { state.swapping--; }
+    if (hadSel && state.sel && state.sel.save === g.saves[0]) select(game, g.saves[0], true);
   }
 
   // ------------------------------------------------------------ carrying a save across
@@ -372,6 +401,11 @@
     if (!state.sel) { say('Pick a save to convert first.'); return; }
     const { game: from, save: s } = state.sel;
     const to = other(from), row = s.el;
+    if (state.swapping || !row || !lists[from].contains(row)) {
+      // the list is still changing: cancel a carried row and let the user press again
+      if (carried) { carried.remove(); $$('.row.dragging').forEach(r => r.classList.remove('dragging')); }
+      return;
+    }
     state.busy = true;
     go.classList.add('working');
     hush();
@@ -390,18 +424,25 @@
     const [res] = await Promise.all([job, wait(240)]);
     Fire.set({ heat: 1 });
 
-    const tg = res && res.ok && res.data[to].find(g => g.saves.some(x => x.id === res.new_id));
+    const tg = res && res.ok && res.data && res.data[to].find(g => g.saves.some(x => x.id === res.new_id));
     if (!tg) {
-      // it did not work: the save comes back out where it was
+      // the save comes back out where it was: it did not work, or it worked but isn't in the list yet
       await outOfGate(c, c._home.x, c._home.y);
       await settle(c);
       c.remove();
       row.classList.remove('dragging');
       go.classList.remove('working');
       Fire.idle();
+      if (res && res.ok) {
+        goText('Done');
+        say(`${res.title} is ready. Load it in ${GAME[to]}.${res.note ? ' ' + res.note : ''}`, false, true);
+        await wait(1500);
+      } else {
+        say((res && res.error) || "That save couldn't be converted.", true);
+      }
       goText('Convert');
-      say((res && res.error) || "That save couldn't be converted.", true);
       state.busy = false;
+      if (res && res.ok) refresh();
       return;
     }
 
@@ -483,7 +524,7 @@
     drag.over = e.clientX > target.left && e.clientX < target.right && e.clientY > target.top && e.clientY < target.bottom;
     panels[other(drag.row._game)].classList.toggle('drop', drag.over);
   });
-  addEventListener('pointerup', async () => {
+  async function endDrag(drop) {
     if (!drag) return;
     const d = drag;
     drag = null;
@@ -491,7 +532,7 @@
     if (!d.started) return;
     panels.og.classList.remove('drop');
     panels.rem.classList.remove('drop');
-    if (d.over) {
+    if (drop && d.over) {
       convert(d.c);
     } else {
       await carryTo(d.c, d.ox, d.oy, 0);
@@ -499,7 +540,11 @@
       d.c.remove();
       d.row.classList.remove('dragging');
     }
-  });
+  }
+  addEventListener('pointerup', () => endDrag(true));
+  // a gesture Windows takes over, or the window losing focus mid-drag: the row just goes back
+  addEventListener('pointercancel', () => endDrag(false));
+  addEventListener('blur', () => endDrag(false));
 
   // ------------------------------------------------------------ events
   $('#panes').addEventListener('click', e => {
@@ -518,14 +563,20 @@
   });
   addEventListener('keydown', e => {
     if (e.key === 'Escape') { closeMenu(); hush(); return; }
-    if (!state.sel || state.busy || e.target.closest('.menu')) return;
-    const list = $$('.row', lists[state.sel.game]);
-    const i = list.findIndex(r => r._save === state.sel.save);
+    if (state.busy || e.target.closest('.menu')) return;
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      // the list the keyboard is in (a focused row), else the one with the picked save
+      const focused = e.target.closest && e.target.closest('.row');
+      const game = focused && focused._game ? focused._game : state.sel && state.sel.game;
+      if (!game) return;
+      const list = $$('.row', lists[game]);
+      const at = focused && focused._game ? focused._save : state.sel && state.sel.game === game ? state.sel.save : null;
+      const i = list.findIndex(r => r._save === at);
       e.preventDefault();
       const r = list[Math.max(0, Math.min(list.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
       if (!r) return;
       select(r._game, r._save);
+      if (focused) r.focus({ preventScroll: true });
       r.scrollIntoView({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
     }
   });

@@ -21,6 +21,7 @@ from .gvas import GvasFile, Prop, find_prop, parse_gvas, serialize_gvas
 TAG = 0x222222229E2A83C1
 CHUNK = 0x20000
 MAX_CHUNK = 0x1000000      # the game uses 0x20000; anything far past that is a broken file
+MAX_DECODED = 512 * 1024 * 1024    # real saves unpack to ~20 MB; this stops a broken file eating memory
 COMPRESSOR_OODLE = 2
 
 
@@ -58,23 +59,21 @@ def decode_segments(data: bytes) -> bytes:
         if tag != TAG:
             raise SaveFormatError(f'bad compressed-archive tag at {r.pos - 8}')
         chunk = r.i64()
-        r.u8()
+        if r.u8() != COMPRESSOR_OODLE:
+            raise SaveFormatError('unknown compressor in the save')
         sc, su = r.i64(), r.i64()
-        # sizes come from the file: check them before trusting them
-        if not 0 < chunk <= MAX_CHUNK or su < 0 or not 0 <= sc <= r.remaining():
+        # sizes come from the file: check them all before decoding anything
+        if not 0 < chunk <= MAX_CHUNK or not 0 <= su <= MAX_DECODED - len(out) or not 0 <= sc <= r.remaining():
             raise SaveFormatError('bad compressed segment sizes')
         n = (su + chunk - 1) // chunk
         if n * 16 > r.remaining():
             raise SaveFormatError('bad compressed chunk count')
         chunks = [(r.i64(), r.i64()) for _ in range(n)]
-        total_c = 0
-        for cs, us in chunks:
-            if not 0 <= us <= chunk or not 0 <= cs <= r.remaining():
-                raise SaveFormatError('bad compressed chunk size')
-            out += oodle.decompress(r.bytes(cs), us)
-            total_c += cs
-        if total_c != sc:
+        if (any(not 0 <= us <= chunk or cs < 0 for cs, us in chunks)
+                or sum(us for _, us in chunks) != su or sum(cs for cs, _ in chunks) != sc or sc > r.remaining()):
             raise SaveFormatError('compressed segment size mismatch')
+        for cs, us in chunks:
+            out += oodle.decompress(r.bytes(cs), us)
     return bytes(out)
 
 

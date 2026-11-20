@@ -4026,10 +4026,15 @@ bool Kraken_DecodeStep(struct KrakenDecoder *dec,
   int n;
 
   if ((offset & 0x3FFFF) == 0) {
+    if (src_end - src < 2)   // Oblivion Converter: bounds check before the header is read
+      return false;
     src = Kraken_ParseHeader(&dec->hdr, src);
     if (!src)
       return false;
   }
+  // Oblivion Converter: saves only use Kraken; refuse the other decoders so less code sees broken input
+  if (dec->hdr.decoder_type != 6)
+    return false;
 
   bool is_kraken_decoder = (dec->hdr.decoder_type == 6 || dec->hdr.decoder_type == 10 || dec->hdr.decoder_type == 12);
 
@@ -4046,6 +4051,8 @@ bool Kraken_DecodeStep(struct KrakenDecoder *dec,
     return true;
   }
 
+  if (src_end - src < 4)     // Oblivion Converter: the smallest quantum header plus data is 4 bytes
+    return false;
   if (is_kraken_decoder) {
     src = Kraken_ParseQuantumHeader(&qhdr, src, dec->hdr.use_checksums);
   } else {
@@ -4127,7 +4134,17 @@ bool Kraken_DecodeStep(struct KrakenDecoder *dec,
   return true;
 }
   
-int Kraken_Decompress(const byte *src, size_t src_len, byte *dst, size_t dst_len) {
+int Kraken_Decompress(const byte *src_in, size_t src_len, byte *dst, size_t dst_len) {
+  // Oblivion Converter: the decoder peeks a few bytes past its position before it checks the end.
+  // Decode from a copy with zeros after it, so those peeks never leave memory we own.
+  if (src_len > 0x10000000 || dst_len > 0x10000000)
+    return -1;
+  byte *padded = (byte*)malloc(src_len + 256);
+  if (!padded)
+    return -1;
+  memcpy(padded, src_in, src_len);
+  memset(padded + src_len, 0, 256);
+  const byte *src = padded;
   KrakenDecoder *dec = Kraken_Create();
   int offset = 0;
   while (dst_len != 0) {
@@ -4143,9 +4160,11 @@ int Kraken_Decompress(const byte *src, size_t src_len, byte *dst, size_t dst_len
   if (src_len != 0)
     goto FAIL;
   Kraken_Destroy(dec);
+  free(padded);
   return offset;
 FAIL:
   Kraken_Destroy(dec);
+  free(padded);
   return -1;
 }
 

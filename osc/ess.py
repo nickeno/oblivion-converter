@@ -96,13 +96,28 @@ def _bs(r: Reader) -> str:
     return decode_text(r.bytes(r.u8()))
 
 
+MAX_BZ = 254                 # a bzstring has a one-byte length that counts its closing zero
+MAX_PLUGINS = 255
+
+
+def fit_text(s: str, limit: int = MAX_BZ) -> str:
+    """`s` cut so it fits a one-byte-length string field."""
+    while len(encode_text(s)) > limit:
+        s = s[:-1]
+    return s.rstrip()
+
+
 def _wbz(w: Writer, s: str):
     b = encode_text(s)
+    if len(b) > MAX_BZ:
+        raise EssError(f'text too long for the save ({len(b)} bytes): {s[:40]}...')
     w.u8(len(b) + 1); w.bytes(b); w.u8(0)
 
 
 def _wbs(w: Writer, s: str):
     b = encode_text(s)
+    if len(b) > 255:
+        raise EssError(f'text too long for the save ({len(b)} bytes): {s[:40]}...')
     w.u8(len(b)); w.bytes(b)
 
 
@@ -168,6 +183,28 @@ def parse_ess(d: bytes) -> Ess:
                regions, records, temp_effects, form_ids, world_spaces, d[r.pos:])
 
 
+def _player_name_at(e: Ess, rec: ChangeRecord, name: str) -> int:
+    """Where the player's record holds `name` (as a bzstring right after race, hair, eyes and sex), or -1."""
+    b = encode_text(name)
+    if len(b) > MAX_BZ:
+        return -1
+    at = rec.data.rfind(bytes([len(b) + 1]) + b + b'\0')
+    return at if at >= 21 else -1
+
+
+def set_player_name(e: Ess, old: str, new: str) -> bool:
+    """Rename the player inside their own change record (the header copy is only for the load menu)."""
+    rec = next((r for r in e.records if r.form_id == PLAYER_REF), None)
+    if rec is None:
+        return False
+    at = _player_name_at(e, rec, old)
+    if at < 0:
+        return False
+    old_b, new_b = encode_text(old), encode_text(fit_text(new))
+    rec.data = rec.data[:at] + bytes([len(new_b) + 1]) + new_b + b'\0' + rec.data[at + len(old_b) + 2:]
+    return True
+
+
 def player_look(e: Ess) -> Optional[tuple]:
     """(race, sex) of the player, or None when it can't be read. Race is (plugin, form id) so it compares
     across saves; sex is 0 male, 1 female.
@@ -180,9 +217,8 @@ def player_look(e: Ess) -> Optional[tuple]:
     rec = next((r for r in e.records if r.form_id == PLAYER_REF), None)
     if rec is None:
         return None
-    name = encode_text(e.pc_name)
-    at = rec.data.rfind(bytes([(len(name) + 1) & 0xFF]) + name + b'\0')
-    if at < 21:
+    at = _player_name_at(e, rec, e.pc_name)
+    if at < 0:
         return None
     sex = rec.data[at - 1]
     iref = int.from_bytes(rec.data[at - 21:at - 17], 'little')
@@ -207,6 +243,8 @@ def serialize_ess(e: Ess, keep_padding: bool = True) -> bytes:
     w.f32(e.game_days); w.u32(e.game_ticks); w.bytes(e.game_time)
     w.u32(len(e.screenshot)); w.bytes(e.screenshot)
     w.patch_u32(size_at, len(w) - hdr_start)
+    if len(e.plugins) > MAX_PLUGINS:
+        raise EssError(f'too many plugins ({len(e.plugins)}, the game allows {MAX_PLUGINS})')
     w.u8(len(e.plugins))
     for p in e.plugins:
         _wbs(w, p)

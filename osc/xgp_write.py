@@ -7,7 +7,7 @@ Game Pass for many games:
 A new container gets state 5 and an empty cloud ETag, so the Xbox services upload it when the game starts.
 
 Oblivion Remastered also keeps `saves_meta` (AllSavesDetails map: slot name -> SaveGameDetails) which the
-load menu reads, so the new save is added there too. That blob is rewritten in place and marked changed.
+load menu reads, so the new save is added there too, as the next revision of that container (marked changed).
 
 The game must be closed while this runs. Back up the wgs folder first.
 """
@@ -36,7 +36,8 @@ def _rws(r: Reader) -> str:
 
 
 def _wws(w: Writer, s: str):
-    w.u32(len(s)); w.bytes(s.encode('utf-16-le'))
+    b = s.encode('utf-16-le', 'surrogatepass')
+    w.u32(len(b) // 2); w.bytes(b)             # the count is UTF-16 units, not letters
 
 
 @dataclass
@@ -68,13 +69,31 @@ class Index:
     entries: list = field(default_factory=list)
 
 
-def read_index(path: Path) -> Index:
-    r = Reader(path.read_bytes())
+def parse_index(raw: bytes) -> Index:
+    r = Reader(raw)
     version, count, unk1 = r.u32(), r.u32(), r.u32()
     idx = Index(version, unk1, _rws(r), r.u64(), r.u32(), _rws(r), r.u64())
     for _ in range(count):
         idx.entries.append(IndexEntry(_rws(r), _rws(r), _rws(r), r.u8(), r.u32(), r.bytes(16),
                                       r.u64(), r.u64(), r.u64()))
+    return idx
+
+
+def read_index(path: Path) -> Index:
+    return parse_index(path.read_bytes())
+
+
+def read_index_for_writing(path: Path) -> Index:
+    """The index, only when this app can write it back exactly as it was (a newer layout would lose data)."""
+    raw = path.read_bytes()
+    try:
+        idx = parse_index(raw)
+        same = write_index(idx) == raw
+    except Exception:
+        same = False
+    if not same:
+        raise ImportError_("The Game Pass save list is in a format this app doesn't know yet, "
+                           "so nothing was changed. Look for a newer version of the app.")
     return idx
 
 
@@ -98,15 +117,27 @@ class ImportError_(Exception):
     pass
 
 
+class RollbackError(ImportError_):
+    """Writing failed and putting the old files back failed too: the save folder may be out of step."""
+
+
 NO_TEMPLATE = 'Save once in Oblivion Remastered first, so there is a save to copy settings from.'
 
 
-def write_atomic(path: Path, data: bytes):
-    """Write next to the file, then swap it in, so a crash never leaves half a file behind."""
-    tmp = path.with_name(path.name + '.osc_tmp')
+def write_atomic(path: Path, data: bytes, overwrite: bool = True):
+    """Write next to the file, then swap it in, so a crash never leaves half a file behind.
+    The temporary name is short and unique, so two writers never share it and long names still fit.
+    With overwrite=False an existing file is never replaced (Windows' rename refuses to)."""
+    tmp = path.with_name(f'.osc{uuid.uuid4().hex[:12]}.tmp')
     try:
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
+        with open(tmp, 'xb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if overwrite:
+            os.replace(tmp, path)
+        else:
+            os.rename(tmp, path)
     except BaseException:
         try:
             tmp.unlink()
@@ -172,15 +203,30 @@ def meta_without_entry(meta_bytes: bytes, slot_name: str) -> bytes:
 
 
 # ----------------------------------------------------------------------------- import
-def _blob_path(folder: Path, entry: IndexEntry) -> Path:
-    from .xgp import read_container_files
-    return read_container_files(folder / entry.folder_name)['Data']
+def _container_bytes(files) -> bytes:
+    """container.N: version 4, then per file a 64-letter name, the cloud copy's guid and the local file's guid."""
+    w = Writer()
+    w.u32(4); w.u32(len(files))
+    for fname, cloud, local in files:
+        w.bytes(fname.encode('utf-16-le').ljust(128, b'\0')[:128])
+        w.bytes(cloud); w.bytes(local)
+    return w.out()
 
 
-def import_save(wgs_user_dir: Path, sav_bytes: bytes, slot_name: str, details_props) -> str:
-    """Add `sav_bytes` as a new save. Returns the container name."""
+def _guid_name(b: bytes) -> str:
+    return uuid.UUID(bytes_le=b).hex.upper()
+
+
+def import_save(wgs_user_dir: Path, sav_bytes: bytes, slot_name: str, details_props, base_slot: str = None) -> str:
+    """Add `sav_bytes` as a new save. Returns the container name.
+
+    Nothing the game reads changes until the last step, writing containers.index. Before that the new save
+    and the new revision of saves_meta are only extra files nobody points at; the game itself saves the same
+    way (a new container.N and data file each time, the old ones removed after). A crash or a failed write
+    before the index is in leaves the saves exactly as they were."""
+    from .xgp import container_file, read_container
     index_path = wgs_user_dir / 'containers.index'
-    idx = read_index(index_path)
+    idx = read_index_for_writing(index_path)
     name = container_name(slot_name)
     if any(e.name == name for e in idx.entries):
         raise ImportError_(f'A save named {name} already exists')
@@ -190,42 +236,80 @@ def import_save(wgs_user_dir: Path, sav_bytes: bytes, slot_name: str, details_pr
     meta_e = next((e for e in idx.entries if e.name == 'saves_meta'), None)
     if meta_e is None:
         raise ImportError_(NO_TEMPLATE)
-    meta_blob = _blob_path(wgs_user_dir, meta_e)
+    meta_folder = wgs_user_dir / meta_e.folder_name
+    meta_cfile = container_file(meta_folder, meta_e.num)
+    meta_files = read_container(meta_cfile)
+    data_i = next((i for i, f in enumerate(meta_files) if f[0] == 'Data'), None)
+    if data_i is None:
+        raise ImportError_(NO_TEMPLATE)
+    meta_blob = meta_folder / _guid_name(meta_files[data_i][2])
     old_meta = meta_blob.read_bytes()
-    new_meta = meta_with_entry(old_meta, slot_name, details_props)
+    new_meta = meta_with_entry(old_meta, slot_name, details_props, base_slot)
 
-    # 2. new container folder + container.1 + data blob (nothing points at it until the index does)
+    made = []                       # taken away again if this stops before the index is written
     folder_guid, file_guid = uuid.uuid4(), uuid.uuid4()
     folder = wgs_user_dir / folder_guid.hex.upper()
+    in_place = meta_e.num >= 255    # the revision number is one byte: past that, rewrite the old file
     try:
+        # 2. new container folder + container.1 + data blob
         folder.mkdir()
-        (folder / file_guid.hex.upper()).write_bytes(sav_bytes)
-        w = Writer()
-        w.u32(4); w.u32(1)
-        w.bytes('Data'.encode('utf-16-le').ljust(128, b'\0'))
-        w.bytes(b'\0' * 16)                 # no cloud copy yet
-        w.bytes(file_guid.bytes_le)
-        (folder / 'container.1').write_bytes(w.out())
+        made.append(folder)
+        write_atomic(folder / file_guid.hex.upper(), sav_bytes, overwrite=False)
+        write_atomic(folder / 'container.1', _container_bytes([('Data', b'\0' * 16, file_guid.bytes_le)]),
+                     overwrite=False)    # no cloud copy yet
 
-        # 3. save list, then the index; if the index can't be written the old save list goes back
+        # 3. the next revision of saves_meta, beside the current one (keeps its cloud guid, like the game)
+        if not in_place:
+            blob_guid = uuid.uuid4()
+            new_blob = meta_folder / blob_guid.hex.upper()
+            write_atomic(new_blob, new_meta, overwrite=False)
+            made.append(new_blob)
+            files = list(meta_files)
+            files[data_i] = ('Data', files[data_i][1], blob_guid.bytes_le)
+            new_cfile = meta_folder / f'container.{meta_e.num + 1}'
+            write_atomic(new_cfile, _container_bytes(files))      # a leftover from a crash is not in use
+            made.append(new_cfile)
+
+        # 4. the index: this is the moment the game sees the new save
         entry = IndexEntry(name, name, '', 1, CONTAINER_CREATED, folder_guid.bytes_le, now, 0, len(sav_bytes))
         place = next((i for i, e in enumerate(idx.entries) if e.name > name), len(idx.entries))   # ordinal order
         idx.entries.insert(place, entry)
         meta_e.mtime, meta_e.size = now, len(new_meta)
+        if not in_place:
+            meta_e.num += 1
         if meta_e.state == 1:
             meta_e.state = CONTAINER_CHANGED
         idx.mtime, idx.state = now, INDEX_CHANGED
         new_index = write_index(idx)
-        write_atomic(meta_blob, new_meta)
-        try:
-            write_atomic(index_path, new_index)
-        except BaseException:
+        if in_place:
+            write_atomic(meta_blob, new_meta)
             try:
-                write_atomic(meta_blob, old_meta)
+                write_atomic(index_path, new_index)
+            except BaseException:
+                try:
+                    write_atomic(meta_blob, old_meta)
+                except BaseException:
+                    raise RollbackError("The save couldn't be added and the save list couldn't be put back. "
+                                        "Restore the backup before playing.")
+                raise
+        else:
+            write_atomic(index_path, new_index)
+    except BaseException:
+        for p in reversed(made):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        raise
+
+    # 5. the old revision of saves_meta is no longer used (the game removes its old ones the same way)
+    if not in_place:
+        for p in (meta_cfile, meta_blob):
+            try:
+                p.unlink()
             except OSError:
                 pass
-            raise
-    except BaseException:
-        shutil.rmtree(folder, ignore_errors=True)
-        raise
     return name

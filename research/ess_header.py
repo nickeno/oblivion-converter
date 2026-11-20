@@ -26,7 +26,9 @@ def parse(b):
     name = bz(); level = struct.unpack_from('<H', b, o)[0]; o += 2
     loc = bz(); days, ticks = struct.unpack_from('<fI', b, o); o += 8
     game_time = struct.unpack_from('<8H', b, o); o += 16
-    shot_size, w, h = struct.unpack_from('<III', b, o)
+    shot_size = struct.unpack_from('<I', b, o)[0]
+    # Remastered keeps no screenshot (size 0): the next bytes are already the plugin list
+    w, h = struct.unpack_from('<II', b, o + 4) if shot_size >= 8 else (0, 0)
     o += 4 + shot_size
     hdr_end = hdr_start + hdr_size
     nplug = b[o]; o += 1

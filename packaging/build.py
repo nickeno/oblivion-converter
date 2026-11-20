@@ -1,11 +1,16 @@
 """Builds dist/NickenosOblivionConverter.exe (one file, no console window).
 
     python packaging/build.py
-Needs: pip install pywebview pillow pyinstaller, and third_party/ooz/build/ooz.dll (see README).
+Needs: pip install -r requirements.txt, and third_party/ooz/build/ooz.dll (see docs/BUILDING.md).
 """
+import platform
+import struct
 import subprocess
 import sys
 from pathlib import Path
+
+if struct.calcsize('P') != 8 or platform.machine().upper() not in ('AMD64', 'X86_64'):
+    sys.exit('Build with 64-bit Python on an x64 PC: ooz.dll is x64 and the .exe has to match it.')
 
 ROOT = Path(__file__).resolve().parent.parent
 HERE = Path(__file__).resolve().parent
