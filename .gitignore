@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+/build/
+/dist/
+build.log
+
+# personal save data and test output
+backups/
+out/
+
+# design scratch (holds real save pictures)
+mockup/
+
+research/orse_ref/
+.claude/

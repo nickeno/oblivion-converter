@@ -1,0 +1,264 @@
+"""Conversions between Oblivion (2006, .ess v0.125) and Oblivion Remastered (.sav with embedded .ess v0.127).
+
+Both directions are EXPERIMENTAL: the top-level save layout is identical between 125 and 127, but
+per-record differences are still being mapped. Unknown bytes are passed through untouched.
+"""
+import datetime
+import io
+import struct
+import uuid
+from typing import Optional
+
+from .binio import Reader, Writer
+from .ess import Ess, parse_ess, serialize_ess
+from .gvas import FStr, Prop, _read_props, _write_props, find_prop, read_fstr, text_prop_string, write_fstr
+from .remastered import RemasteredSave, open_save, seal_save
+
+OG_VERSION = 125
+REMASTER_VERSION = 127
+OG_SHOT_W, OG_SHOT_H = 256, 144
+ALTAR_PLUGINS = ('altaresp', 'altardeluxe')
+
+# UE-side extras kept when building a Remastered save from a template; the rest belong to the
+# template's world (physics poses, cinematics, sneaking actors, created-form visuals) and are dropped.
+KEEP_EXTRAS = ('UserInputTextSaveData', 'VRaceSexSave', 'VAltarSaveIdentificationData',
+               'VAltarPersuasionMenuSaveData')   # plus the player's own 'Phenotype' (face), matched exactly
+
+
+# ----------------------------------------------------------------------------- helpers
+def _text_payload(s: str, flags: int) -> bytes:
+    w = Writer()
+    w.u32(flags); w.u8(0xFF); w.u32(1); write_fstr(w, s)
+    return w.out()
+
+
+def _pretty_location(loc: str) -> str:
+    if loc.startswith('LOC_FN_'):
+        loc = loc[7:].rstrip('0123456789')   # FortUrasek02 -> FortUrasek
+    out = ''
+    for i, c in enumerate(loc):
+        if i and c.isupper() and (loc[i - 1].islower() or (i + 1 < len(loc) and loc[i + 1].islower() and loc[i - 1].isupper())):
+            out += ' '
+        out += c
+    return out
+
+
+def _pad_to(data: bytes, align: int) -> bytes:
+    return data + b'\0' * (-len(data) % align)
+
+
+def _jpeg_to_og_screenshot(jpeg: Optional[bytes]) -> bytes:
+    w = Writer()
+    w.u32(OG_SHOT_W); w.u32(OG_SHOT_H)
+    pixels = None
+    if jpeg:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(jpeg)).convert('RGB').resize((OG_SHOT_W, OG_SHOT_H))
+            pixels = img.tobytes()
+        except Exception:
+            pixels = None
+    w.bytes(pixels or bytes([40, 40, 40]) * (OG_SHOT_W * OG_SHOT_H))
+    return w.out()
+
+
+def _og_screenshot_to_jpeg(shot: bytes, size) -> Optional[bytes]:
+    try:
+        from PIL import Image
+        r = Reader(shot)
+        w, h = r.u32(), r.u32()
+        img = Image.frombytes('RGB', (w, h), r.bytes(w * h * 3)).resize(size)
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=90)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _jpeg_size(jpeg: bytes):
+    try:
+        from PIL import Image
+        return Image.open(io.BytesIO(jpeg)).size
+    except Exception:
+        return None
+
+
+def display_name(save: RemasteredSave) -> str:
+    return text_prop_string(save.detail('DisplayPlayerName')) or ''
+
+
+# ----------------------------------------------------------------------------- Remastered -> OG
+def remastered_to_og(sav_bytes: bytes, save_num: Optional[int] = None) -> bytes:
+    save = open_save(sav_bytes)
+    e = parse_ess(save.ess)
+    e.minor_version = OG_VERSION
+    e.header_version = OG_VERSION
+    if save_num is not None:
+        e.save_num = save_num
+    name = display_name(save)
+    if name:
+        e.pc_name = name
+    loc = save.detail('PlayerLocation')
+    e.pc_location = _pretty_location(loc.value.s if loc else e.pc_location)
+    thumb = save.detail('SaveThumbnail')
+    e.screenshot = _jpeg_to_og_screenshot(thumb.data if thumb else None)
+    for rec in e.records:
+        rec.version = OG_VERSION
+    e.padding = b''
+    return serialize_ess(e)
+
+
+# ----------------------------------------------------------------------------- OG -> Remastered
+def _altar_items(save: RemasteredSave):
+    sa = find_prop(save.inner.props, 'SerializedAltarSaveDataArray')
+    return sa.structs['items'] if sa and sa.structs else []
+
+
+def _item_name(item) -> str:
+    p = find_prop(item, 'SaveDataName')
+    return p.value.s if p else ''
+
+
+def _item_blob(item) -> Prop:
+    return find_prop(item, 'SerializedData')
+
+
+def _parse_blob(data: bytes):
+    r = Reader(data)
+    props = _read_props(r, len(data))
+    return props, data[r.pos:]
+
+
+def _serialize_blob(props, trailer: bytes) -> bytes:
+    w = Writer()
+    _write_props(w, props)
+    w.bytes(trailer)
+    return w.out()
+
+
+def _set_user_text(save: RemasteredSave, key: str, value: str) -> bool:
+    """Rewrite one entry of UserInputTextsMap (MapProperty<Str, Text>) inside the UE extras."""
+    for item in _altar_items(save):
+        if not _item_name(item).startswith('UserInputTextSaveData'):
+            continue
+        blob = _item_blob(item)
+        props, trailer = _parse_blob(blob.data)
+        mp = find_prop(props, 'UserInputTextsMap')
+        if not mp:
+            return False
+        r = Reader(mp.raw)
+        r.u32()                      # keys to remove
+        count = r.u32()
+        for _ in range(count):
+            k_start = r.pos
+            k = read_fstr(r).s
+            v_start = r.pos
+            flags = r.u32(); hist = r.u8()
+            if hist == 0xFF:
+                if r.u32():
+                    read_fstr(r)
+            else:
+                raise ValueError('unsupported FText history in UserInputTextsMap')
+            if k == key:
+                mp.raw = mp.raw[:v_start] + _text_payload(value, flags) + mp.raw[r.pos:]
+                blob.data = _serialize_blob(props, trailer)
+                return True
+        return False
+    return False
+
+
+def _set_guid_struct(props, name: str, guid: bytes):
+    p = find_prop(props, name)
+    if p and p.kind == 'struct' and p.raw is not None and len(p.raw) == 16:
+        p.raw = guid
+
+
+def location_key(og_location: str) -> str:
+    """'Anvil Mages Guild' -> 'LOC_FN_AnvilMagesGuild' (Remastered stores a localisation key)."""
+    return 'LOC_FN_' + ''.join(c for c in og_location if c.isalnum())
+
+
+def slot_name_for(number: int, play_seconds: int, name: str, loc_key: str, level: int) -> str:
+    h, rem = divmod(max(0, play_seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f'Save {number}, Playing Time {h:02d}.{m:02d}.{s:02d} - {name} - {loc_key}, Level {level}'
+
+
+def og_to_remastered(ess_bytes: bytes, template_sav: bytes, record_version: int = OG_VERSION,
+                     keep_all_extras: bool = False, save_number: int = 99) -> bytes:
+    save = open_save(template_sav)
+    tmpl = parse_ess(save.ess)
+    e = parse_ess(ess_bytes)
+    og_name, og_loc, og_shot = e.pc_name, e.pc_location, e.screenshot
+    loc_key = location_key(og_loc)
+
+    # .ess header: Remastered keeps no screenshot and uses localisation keys for name/location
+    e.minor_version = REMASTER_VERSION
+    e.header_version = REMASTER_VERSION
+    e.exe_time = tmpl.exe_time
+    e.pc_name = tmpl.pc_name               # e.g. UI_UserInputText_0_953_0 -> resolved via UserInputTextsMap
+    e.pc_location = loc_key
+    e.screenshot = b''
+    for rec in e.records:
+        rec.version = record_version
+    if not any(p.lower().startswith(ALTAR_PLUGINS) for p in e.plugins):
+        e.plugins.append('AltarESPMain.esp')
+    e.padding = b''
+    ess_out = _pad_to(serialize_ess(e), 0x1000)
+
+    # player name text
+    _set_user_text(save, tmpl.pc_name, og_name)
+
+    # save details
+    det = save.details.props
+    find_prop(det, 'PlayerLevel').value = e.pc_level
+    find_prop(det, 'InGameDate').value = float(e.game_days)
+    pt = find_prop(det, 'PlayTime')
+    if pt and pt.raw is not None:
+        pt.raw = struct.pack('<q', int(e.game_ticks) * 10_000)   # ms -> 100 ns ticks
+    dn = find_prop(det, 'DisplayPlayerName')
+    if dn is not None:
+        dn.raw = _text_payload(og_name, Reader(dn.raw).u32())
+    find_prop(det, 'PlayerLocation').value = FStr(loc_key)
+    slot = find_prop(det, 'SlotName')
+    if slot is not None:
+        slot.value = FStr(slot_name_for(save_number, int(e.game_ticks) // 1000, og_name, loc_key, e.pc_level))
+    sn = find_prop(det, 'SaveName')
+    if sn is not None:
+        sn.value = FStr('Save')
+    num = find_prop(det, 'SaveNumber')
+    if num is not None:
+        num.value = save_number - 1
+    sd = find_prop(det, 'SaveDate')
+    if sd is not None and sd.raw is not None and len(sd.raw) == 8:
+        ticks = int((datetime.datetime.now() - datetime.datetime(1, 1, 1)).total_seconds() * 10_000_000)
+        sd.raw = struct.pack('<q', ticks)
+    thumb = find_prop(det, 'SaveThumbnail')
+    if thumb is not None and thumb.data:
+        size = _jpeg_size(thumb.data)
+        jpg = _og_screenshot_to_jpeg(og_shot, size) if size else None
+        if jpg:
+            thumb.data = jpg
+
+    # fresh character / save ids so the game treats this as its own character
+    char_id, save_id = uuid.uuid4().bytes_le, uuid.uuid4().bytes_le
+    _set_guid_struct(det, 'CharacterId', char_id)
+
+    # UE extras
+    items = _altar_items(save)
+    kept = []
+    for item in items:
+        nm = _item_name(item)
+        base = nm if nm == 'Phenotype' else nm.rsplit('_', 1)[0]
+        if keep_all_extras or base in KEEP_EXTRAS or nm == 'Phenotype':
+            if base == 'VAltarSaveIdentificationData':
+                blob = _item_blob(item)
+                props, trailer = _parse_blob(blob.data)
+                _set_guid_struct(props, 'CharacterId', char_id)
+                _set_guid_struct(props, 'SaveID', save_id)
+                blob.data = _serialize_blob(props, trailer)
+            kept.append(item)
+    if items is not None and not keep_all_extras:
+        items[:] = kept
+
+    return seal_save(save, ess_out)

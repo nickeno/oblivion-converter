@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nickeno's Oblivion Converter</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <span class="word">Nickeno's Oblivion Converter</span>
+    <button class="pill" id="b-backups" title="Open the folder with your save backups">Backups</button>
+  </header>
+
+  <main class="panes" id="panes">
+    <section class="pane" data-game="og">
+      <div class="logo"><img src="assets/logo-original.png" alt="The Elder Scrolls IV: Oblivion"></div>
+      <div class="panel" data-game="og">
+        <div class="p-head">
+          <button class="who" data-game="og" aria-haspopup="menu" aria-expanded="false" hidden></button>
+          <span class="count" id="count-og"></span>
+        </div>
+        <div class="list" id="list-og" role="listbox" aria-label="Oblivion saves"></div>
+      </div>
+    </section>
+
+    <div class="gutter" id="gutter">
+      <div class="go-wrap" id="go-wrap">
+        <div class="gate" id="gate" aria-hidden="true"></div>
+        <canvas class="fire" id="fire" aria-hidden="true"></canvas>
+        <button class="go" id="go">
+          <svg class="icon arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          <span class="go-l" id="go-l">Convert</span>
+        </button>
+      </div>
+    </div>
+
+    <section class="pane" data-game="rem">
+      <div class="logo"><img src="assets/logo-remastered.png" alt="The Elder Scrolls IV: Oblivion Remastered"></div>
+      <div class="panel" data-game="rem">
+        <div class="p-head">
+          <button class="who" data-game="rem" aria-haspopup="menu" aria-expanded="false" hidden></button>
+          <span class="count" id="count-rem"></span>
+        </div>
+        <div class="list" id="list-rem" role="listbox" aria-label="Oblivion Remastered saves"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="menu" id="menu" role="menu" hidden></div>
+<div class="note" id="note" role="status" aria-live="polite" hidden></div>
+
+<script src="fire.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

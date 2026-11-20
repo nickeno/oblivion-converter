@@ -1,0 +1,485 @@
+"""Finds saves on this PC and converts them. This is what the app window talks to.
+
+Paths can be overridden for testing: OSC_OG_SAVES, OSC_STEAM_REM, OSC_WGS (a wgs user folder),
+OSC_BACKUPS.
+"""
+import base64
+import ctypes
+import datetime
+import io
+import os
+import re
+import struct
+import subprocess
+import time
+import uuid
+import zipfile
+from ctypes import wintypes
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
+
+from . import xgp, xgp_write
+from .binio import Reader
+from .convert import (OG_SHOT_H, OG_SHOT_W, display_name, og_to_remastered, remastered_to_og,
+                      _pretty_location)
+from .gvas import find_prop, parse_gvas, text_prop_string
+from .remastered import open_save
+
+REMASTERED_EXES = ('OblivionRemastered-WinGDK-Shipping.exe', 'OblivionRemastered-Win64-Shipping.exe')
+APP_DIR_NAME = "Nickeno's Oblivion Converter"
+KEEP_BACKUPS = 20          # newest backups kept per store; each is a zip of the whole save folder
+
+
+class UserError(Exception):
+    """Something the user can fix; the message is shown as-is."""
+
+
+# ----------------------------------------------------------------------------- folders
+def documents_dir() -> Path:
+    """The real Documents folder, also when it is moved to OneDrive."""
+    try:
+        class GUID(ctypes.Structure):
+            _fields_ = [('a', wintypes.DWORD), ('b', wintypes.WORD), ('c', wintypes.WORD), ('d', ctypes.c_ubyte * 8)]
+        u = uuid.UUID('FDD39AD0-238F-46AF-ADB4-6C85480369C7')     # FOLDERID_Documents
+        g = GUID(u.fields[0], u.fields[1], u.fields[2], (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        p = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(p)) == 0:
+            path = p.value
+            ctypes.windll.ole32.CoTaskMemFree(p)
+            return Path(path)
+    except Exception:
+        pass
+    return Path.home() / 'Documents'
+
+
+def og_saves_dir() -> Path:
+    return Path(os.environ.get('OSC_OG_SAVES') or documents_dir() / 'My Games' / 'Oblivion' / 'Saves')
+
+
+def steam_rem_dir() -> Path:
+    return Path(os.environ.get('OSC_STEAM_REM') or
+                documents_dir() / 'My Games' / 'Oblivion Remastered' / 'Saved' / 'SaveGames')
+
+
+def xbox_dirs() -> list:
+    if os.environ.get('OSC_WGS'):
+        return [Path(os.environ['OSC_WGS'])]
+    return xgp.default_wgs_dirs()
+
+
+def backups_dir() -> Path:
+    return Path(os.environ.get('OSC_BACKUPS') or documents_dir() / APP_DIR_NAME / 'Backups')
+
+
+def running_exes() -> set:
+    try:
+        out = subprocess.run(['tasklist', '/fo', 'csv', '/nh'], capture_output=True, text=True,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout
+        return {line.split('","')[0].strip('"').lower() for line in out.splitlines() if line}
+    except Exception:
+        return set()
+
+
+def remastered_running() -> bool:
+    exes = running_exes()
+    return any(e.lower() in exes for e in REMASTERED_EXES)
+
+
+# ----------------------------------------------------------------------------- model
+@dataclass
+class SaveEntry:
+    id: str
+    game: str              # 'og' | 'remastered'
+    store: str             # 'og' | 'xbox' | 'steam'
+    title: str             # 'Save 527', 'Autosave 5', 'Quicksave'
+    character: str
+    character_key: str     # groups saves of one character
+    level: int
+    location: str
+    play_seconds: int
+    saved_at: float        # unix time
+    kind: str              # 'manual' | 'auto' | 'quick'
+
+    def to_json(self):
+        return asdict(self)
+
+
+# ----------------------------------------------------------------------------- original Oblivion
+def _bz(r: Reader) -> str:
+    n = r.u8()
+    return r.bytes(n)[:max(0, n - 1)].decode('cp1252', 'replace')
+
+
+def _og_header(head: bytes):
+    """Fields up to the screenshot, from the first ~1 KB of an .ess."""
+    r = Reader(head)
+    if r.bytes(12) != b'TES4SAVEGAME':
+        return None
+    r.u8(); r.u8(); r.bytes(16); r.u32(); r.u32()
+    save_num = r.u32()
+    name = _bz(r)
+    level = r.u16()
+    loc = _bz(r)
+    days = r.f32()
+    ticks = r.u32()
+    st_offset = r.pos
+    st = struct.unpack('<8H', r.bytes(16))          # SYSTEMTIME of the real-world save
+    shot_size = r.u32()
+    return dict(save_num=save_num, name=name, level=level, location=loc, days=days, ticks=ticks,
+                systime=st, systime_offset=st_offset, shot_offset=r.pos, shot_size=shot_size)
+
+
+def _systime_to_unix(st) -> Optional[float]:
+    y, mo, _dow, d, h, mi, s, ms = st
+    try:
+        return datetime.datetime(y, mo, d, h, mi, s, ms * 1000).timestamp()
+    except Exception:
+        return None
+
+
+def _og_title(stem: str) -> tuple:
+    low = stem.lower()
+    if low.startswith('autosave'):
+        return 'Autosave', 'auto'
+    if low.startswith('quicksave'):
+        return 'Quicksave', 'quick'
+    return stem.split(' - ')[0].strip() or stem, 'manual'
+
+
+def list_og() -> list:
+    d = og_saves_dir()
+    out = []
+    if not d.is_dir():
+        return out
+    for f in d.glob('*.ess'):
+        try:
+            with open(f, 'rb') as fh:
+                h = _og_header(fh.read(2048))
+            if not h:
+                continue
+            title, kind = _og_title(f.stem)
+            when = _systime_to_unix(h['systime']) or f.stat().st_mtime
+            out.append(SaveEntry('og:' + f.name, 'og', 'og', title, h['name'], 'og:' + h['name'].lower(),
+                                 h['level'], h['location'], h['ticks'] // 1000, when, kind))
+        except Exception:
+            continue
+    out.sort(key=lambda s: s.saved_at, reverse=True)
+    return out
+
+
+def _og_thumbnail(path: Path) -> Optional[bytes]:
+    with open(path, 'rb') as fh:
+        head = fh.read(2048)
+        h = _og_header(head)
+        if not h or h['shot_size'] < 8:
+            return None
+        fh.seek(h['shot_offset'])
+        shot = fh.read(h['shot_size'])
+    from PIL import Image
+    r = Reader(shot)
+    w, hgt = r.u32(), r.u32()
+    img = Image.frombytes('RGB', (w, hgt), r.bytes(w * hgt * 3))
+    buf = io.BytesIO()
+    img.save(buf, 'JPEG', quality=85)
+    return buf.getvalue()
+
+
+# ----------------------------------------------------------------------------- Remastered
+def _ticks_to_unix(ticks: int) -> Optional[float]:
+    try:
+        return (datetime.datetime(1, 1, 1) + datetime.timedelta(microseconds=ticks // 10)).timestamp()
+    except Exception:
+        return None
+
+
+def _rem_entry(entry_id: str, store: str, props: list) -> SaveEntry:
+    def v(n, default=None):
+        p = find_prop(props, n)
+        return p if p is not None else default
+    name = text_prop_string(v('DisplayPlayerName')) or ''
+    level = v('PlayerLevel').value if v('PlayerLevel') else 0
+    loc = v('PlayerLocation').value.s if v('PlayerLocation') else ''
+    pt = v('PlayTime'); play = struct.unpack('<q', pt.raw)[0] // 10_000_000 if pt and pt.raw else 0
+    sd = v('SaveDate'); when = _ticks_to_unix(struct.unpack('<q', sd.raw)[0]) if sd and sd.raw else None
+    typ = v('Type').value.s if v('Type') else ''
+    num = v('SaveNumber').value if v('SaveNumber') else 0
+    save_name = v('SaveName').value.s.lower() if v('SaveName') else ''
+    if 'Quick' in typ or save_name == 'quicksave':
+        title, kind = 'Quicksave', 'quick'
+    elif 'Auto' in typ or save_name == 'autosave':
+        title, kind = f'Autosave {num + 1}', 'auto'
+    else:
+        title, kind = f'Save {num + 1}', 'manual'
+    cid = v('CharacterId')
+    ckey = (cid.raw.hex() if cid is not None and cid.raw else name.lower())
+    return SaveEntry(entry_id, 'remastered', store, title, name, store + ':' + ckey, level,
+                     _pretty_location(loc) if loc.startswith('LOC_') else loc, play, when or 0, kind)
+
+
+_meta_cache: dict = {}
+
+
+def _meta_by_container(meta_bytes: bytes) -> dict:
+    """container/file name -> (slot key, props) from saves_meta."""
+    key = (len(meta_bytes), hash(meta_bytes))
+    if key in _meta_cache:
+        return _meta_cache[key]
+    meta = parse_gvas(meta_bytes)
+    _mp, _rem, entries = xgp_write._meta_map(meta)
+    out = {}
+    for k, props in entries:
+        out[xgp_write.container_name(k.s)] = (k.s, props)
+        out[k.s] = (k.s, props)
+    _meta_cache.clear()
+    _meta_cache[key] = out
+    return out
+
+
+SKIP_REM = ('saves_meta', 'save_settings', 'wingdk_save_settings')
+
+
+def list_remastered() -> list:
+    out = []
+    for wgs in xbox_dirs():
+        try:
+            saves = xgp.list_saves(wgs)
+        except Exception:
+            continue
+        by_name = {s.name: s for s in saves}
+        meta = {}
+        if 'saves_meta' in by_name:
+            try:
+                meta = _meta_by_container(by_name['saves_meta'].data_file.read_bytes())
+            except Exception:
+                meta = {}
+        for s in saves:
+            if s.name.lower() in SKIP_REM:
+                continue
+            eid = f'xbox:{wgs.name}:{s.name}'
+            try:
+                props = meta[s.name][1] if s.name in meta else open_save(s.data_file.read_bytes()).details.props
+                out.append(_rem_entry(eid, 'xbox', props))
+            except Exception:
+                continue
+    sd = steam_rem_dir()
+    if sd.is_dir():
+        meta = {}
+        mf = sd / 'saves_meta.sav'
+        if mf.is_file():
+            try:
+                meta = _meta_by_container(mf.read_bytes())
+            except Exception:
+                meta = {}
+        for f in sd.glob('*.sav'):
+            if f.stem.lower() in SKIP_REM:
+                continue
+            try:
+                props = meta[f.stem][1] if f.stem in meta else open_save(f.read_bytes()).details.props
+                out.append(_rem_entry('steam:' + f.name, 'steam', props))
+            except Exception:
+                continue
+    out.sort(key=lambda s: s.saved_at, reverse=True)
+    return out
+
+
+def _rem_bytes(entry_id: str) -> bytes:
+    kind, rest = entry_id.split(':', 1)
+    if kind == 'steam':
+        return (steam_rem_dir() / rest).read_bytes()
+    wgs_name, name = rest.split(':', 1)
+    for wgs in xbox_dirs():
+        if wgs.name == wgs_name:
+            for s in xgp.list_saves(wgs):
+                if s.name == name:
+                    return s.data_file.read_bytes()
+    raise UserError('That save is gone. Refresh the list.')
+
+
+def _rem_thumbnail(entry_id: str) -> Optional[bytes]:
+    kind, rest = entry_id.split(':', 1)
+    try:
+        if kind == 'xbox':
+            wgs_name, name = rest.split(':', 1)
+            for wgs in xbox_dirs():
+                if wgs.name == wgs_name:
+                    saves = {s.name: s for s in xgp.list_saves(wgs)}
+                    if 'saves_meta' in saves:
+                        meta = _meta_by_container(saves['saves_meta'].data_file.read_bytes())
+                        if name in meta:
+                            p = find_prop(meta[name][1], 'SaveThumbnail')
+                            if p is not None and p.data:
+                                return p.data
+        elif kind == 'steam':
+            mf = steam_rem_dir() / 'saves_meta.sav'
+            if mf.is_file():
+                meta = _meta_by_container(mf.read_bytes())
+                stem = Path(rest).stem
+                if stem in meta:
+                    p = find_prop(meta[stem][1], 'SaveThumbnail')
+                    if p is not None and p.data:
+                        return p.data
+    except Exception:
+        pass
+    p = open_save(_rem_bytes(entry_id)).detail('SaveThumbnail')
+    return p.data if p is not None and p.data else None
+
+
+# ----------------------------------------------------------------------------- public API
+def thumbnail(entry_id: str) -> Optional[str]:
+    """data: URL of the save's picture. Not cached here: autosaves and quicksaves are overwritten in place."""
+    try:
+        if entry_id.startswith('og:'):
+            jpg = _og_thumbnail(og_saves_dir() / entry_id[3:])
+        else:
+            jpg = _rem_thumbnail(entry_id)
+    except Exception:
+        jpg = None
+    return 'data:image/jpeg;base64,' + base64.b64encode(jpg).decode() if jpg else None
+
+
+def status() -> dict:
+    return {
+        'og_dir': str(og_saves_dir()), 'og_found': og_saves_dir().is_dir(),
+        'xbox_found': bool(xbox_dirs()), 'steam_dir': str(steam_rem_dir()), 'steam_found': steam_rem_dir().is_dir(),
+        'backups_dir': str(backups_dir()),
+    }
+
+
+def _hms(seconds: int) -> str:
+    h, rem = divmod(max(0, int(seconds)), 3600)
+    m, s = divmod(rem, 60)
+    return f'{h:02d}.{m:02d}.{s:02d}'
+
+
+def _safe_filename(s: str) -> str:
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', s).strip() or 'Save'
+
+
+def to_og(entry_id: str, target_dir: Optional[str] = None) -> dict:
+    """Remastered save -> new .ess in the original game's Saves folder (or target_dir)."""
+    out_dir = Path(target_dir) if target_dir else og_saves_dir()
+    if not out_dir.is_dir():
+        raise UserError("Original Oblivion's save folder wasn't found. Start the original game once, or pick a folder.")
+    nums = []
+    for f in out_dir.glob('Save *.ess'):
+        m = re.match(r'Save (\d+)\b', f.stem)
+        if m:
+            nums.append(int(m.group(1)))
+    n = max(nums, default=0) + 1
+    data = remastered_to_og(_rem_bytes(entry_id), save_num=n)
+    h = _og_header(data[:2048])
+    # the new save is made now, so it shows up as the newest one
+    now = datetime.datetime.now()
+    stamp = struct.pack('<8H', now.year, now.month, (now.weekday() + 1) % 7, now.day,
+                        now.hour, now.minute, now.second, now.microsecond // 1000)
+    data = data[:h['systime_offset']] + stamp + data[h['systime_offset'] + 16:]
+    name = (f'Save {n} - {h["name"]} - {h["location"]}, Level {h["level"]}, '
+            f'Playing Time {_hms(h["ticks"] // 1000)}.ess')
+    path = out_dir / _safe_filename(name)
+    tmp = path.with_suffix('.ess.tmp')
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return {'id': 'og:' + path.name, 'path': str(path), 'title': f'Save {n}', 'where': 'Original Oblivion > Load'}
+
+
+def _backup(src: Path, label: str) -> Path:
+    bdir = backups_dir()
+    bdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    zpath = bdir / f'{label}_{stamp}.zip'
+    with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED) as z:
+        if src.is_dir():
+            for f in src.rglob('*'):
+                if f.is_file():
+                    z.write(f, f.relative_to(src.parent))
+        else:
+            z.write(src, src.name)
+    for old in sorted(bdir.glob(f'{label}_*.zip'), reverse=True)[KEEP_BACKUPS:]:   # names sort by date
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return zpath
+
+
+def _newest_rem(store: str, wgs_name: Optional[str] = None) -> Optional[SaveEntry]:
+    for s in list_remastered():
+        if s.store == store and (wgs_name is None or s.id.split(':')[1] == wgs_name):
+            return s
+    return None
+
+
+def remastered_targets() -> list:
+    t = []
+    for wgs in xbox_dirs():
+        t.append({'id': f'xbox:{wgs.name}', 'label': 'Game Pass / Xbox app'})
+    if steam_rem_dir().is_dir():
+        t.append({'id': 'steam', 'label': 'Steam'})
+    return t
+
+
+def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
+    """OG .ess -> new Remastered save, added to the Game Pass or Steam save folder."""
+    if not entry_id.startswith('og:'):
+        raise UserError('Pick an original Oblivion save.')
+    targets = remastered_targets()
+    if not targets:
+        raise UserError("No Oblivion Remastered saves were found. Play Remastered and save once first.")
+    target = target or targets[0]['id']
+    if target not in [t['id'] for t in targets]:
+        raise UserError("That Oblivion Remastered save folder is gone. Refresh and try again.")
+    # the game keeps its saves open while it runs (a test copy of the folder is not the game's)
+    test_copy = os.environ.get('OSC_WGS' if target.startswith('xbox:') else 'OSC_STEAM_REM')
+    if not test_copy and remastered_running():
+        raise UserError('Close Oblivion Remastered first, then try again.')
+    try:
+        ess = (og_saves_dir() / entry_id[3:]).read_bytes()
+    except OSError:
+        raise UserError('That save is gone. Refresh the list.')
+
+    def build(template: bytes, taken) -> tuple:
+        """The converted save under the first free 'Save N' name (the same save converted twice)."""
+        for n in range(1, 200):
+            sav = og_to_remastered(ess, template, save_number=n)
+            details = open_save(sav).details.props
+            slot = find_prop(details, 'SlotName').value.s
+            if not taken(slot):
+                return sav, details, slot, n
+        raise UserError('That save has been converted too many times. Delete some copies in Remastered first.')
+
+    if target.startswith('xbox:'):
+        wgs_name = target.split(':', 1)[1]
+        wgs = next((w for w in xbox_dirs() if w.name == wgs_name), None)
+        tmpl = _newest_rem('xbox', wgs_name)
+        if wgs is None or tmpl is None:
+            raise UserError('Save once in Oblivion Remastered first, so there is a save to copy settings from.')
+        names = {e.name for e in xgp_write.read_index(wgs / 'containers.index').entries}
+        sav, details, slot, n = build(_rem_bytes(tmpl.id), lambda s: xgp_write.container_name(s) in names)
+        backup = _backup(wgs, 'GamePass')
+        try:
+            name = xgp_write.import_save(wgs, sav, slot, details)
+        except xgp_write.ImportError_ as e:
+            raise UserError(str(e))
+        return {'id': f'xbox:{wgs_name}:{name}', 'title': f'Save {n}', 'container': name, 'backup': str(backup),
+                'where': 'Oblivion Remastered > Load > ' + display_name(open_save(sav))}
+
+    # Steam: the save is a plain file named after its slot, listed in saves_meta.sav
+    sd = steam_rem_dir()
+    tmpl = _newest_rem('steam')
+    if tmpl is None:
+        raise UserError('Save once in Oblivion Remastered first, so there is a save to copy settings from.')
+    sav, details, slot, n = build(_rem_bytes(tmpl.id), lambda s: (sd / (_safe_filename(s) + '.sav')).exists())
+    path = sd / (_safe_filename(slot) + '.sav')
+    backup = _backup(sd / 'saves_meta.sav', 'Steam') if (sd / 'saves_meta.sav').is_file() else None
+    tmp = path.with_suffix('.sav.tmp')
+    tmp.write_bytes(sav)
+    os.replace(tmp, path)
+    mf = sd / 'saves_meta.sav'
+    if mf.is_file():
+        new_meta = xgp_write.meta_with_entry(mf.read_bytes(), path.stem, details)
+        mtmp = mf.with_suffix('.sav.tmp')
+        mtmp.write_bytes(new_meta)
+        os.replace(mtmp, mf)
+    return {'id': 'steam:' + path.name, 'title': f'Save {n}', 'path': str(path),
+            'backup': str(backup) if backup else None, 'where': 'Oblivion Remastered > Load'}
