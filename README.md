@@ -20,7 +20,7 @@ That's it. Works with Steam, GOG and Game Pass.
 - Your old saves are never touched. Remastered saves get backed up first.
 - Windows might say "unknown publisher". Click More info, then Run anyway.
 - The original game warns about missing content. Just hit Yes.
-- In Remastered your character gets the look of your newest Remastered character.
+- Faces don't carry over. Your character borrows the face of a Remastered character with the same race and sex, so make one first.
 - Still experimental. Modded saves aren't tested.
 
 Fan-made, not affiliated with Bethesda. GPL-3.0. [Credits](THIRD-PARTY.md), [building it yourself](docs/BUILDING.md).

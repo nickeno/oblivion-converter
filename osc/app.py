@@ -79,7 +79,7 @@ class Api:
                 else:
                     res = library.to_og(entry_id)
                 return {'ok': True, 'new_id': res['id'], 'title': res['title'], 'where': res['where'],
-                        'backup': res.get('backup'), 'data': _data()}
+                        'backup': res.get('backup'), 'note': res.get('note'), 'data': _data()}
             except library.UserError as e:
                 return {'ok': False, 'error': str(e)}
             except Exception:
@@ -156,9 +156,42 @@ def _selftest(window, out_path: str):
     window.destroy()
 
 
+WEBVIEW2_LINK = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'       # Microsoft's own small installer
+WEBVIEW2_KEYS = ('{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', '{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}',
+                 '{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}', '{65C35B14-6C1D-4122-AC46-7148CC9D6497}')
+
+
+def _has_webview2() -> bool:
+    """Is the part of Windows that draws the window there? (Windows 11 has it, an old Windows 10 may not.)
+    Without it the window would open in the old Internet Explorer engine and show a broken page."""
+    import winreg
+    for root, base in ((winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients'),
+                       (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\EdgeUpdate\Clients'),
+                       (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\EdgeUpdate\Clients')):
+        for key in WEBVIEW2_KEYS:
+            try:
+                with winreg.OpenKey(root, base + '\\' + key) as k:
+                    if str(winreg.QueryValueEx(k, 'pv')[0]).strip('0.'):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def _ask_for_webview2():
+    import ctypes
+    import webbrowser
+    text = ("This app needs Microsoft Edge WebView2, and this PC doesn't have it.\n\n"
+            "Press OK to get it from Microsoft. Install it, then open the app again.")
+    if ctypes.windll.user32.MessageBoxW(None, text, TITLE, 0x1 | 0x30) == 1:       # OK/Cancel, warning sign
+        webbrowser.open(WEBVIEW2_LINK)
+
+
 def main():
     if '--serve' in sys.argv:
         return serve(int(sys.argv[sys.argv.index('--serve') + 1]))
+    if not _has_webview2():
+        return _ask_for_webview2()
     import webview
     window = webview.create_window(TITLE, str(UI_DIR / 'index.html'), js_api=Api(), width=1280, height=820,
                                    min_size=(940, 640), background_color='#15120f')

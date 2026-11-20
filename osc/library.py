@@ -21,6 +21,7 @@ from . import xgp, xgp_write
 from .binio import Reader
 from .convert import (OG_SHOT_H, OG_SHOT_W, display_name, og_to_remastered, remastered_to_og,
                       _pretty_location)
+from .ess import decode_text, parse_ess, player_look
 from .gvas import find_prop, parse_gvas, text_prop_string
 from .remastered import open_save
 
@@ -54,7 +55,24 @@ def documents_dir() -> Path:
 
 
 def og_saves_dir() -> Path:
-    return Path(os.environ.get('OSC_OG_SAVES') or documents_dir() / 'My Games' / 'Oblivion' / 'Saves')
+    if os.environ.get('OSC_OG_SAVES'):
+        return Path(os.environ['OSC_OG_SAVES'])
+    home = documents_dir() / 'My Games' / 'Oblivion'
+    return _ini_saves_dir(home) or home / 'Saves'
+
+
+def _ini_saves_dir(home: Path) -> Optional[Path]:
+    """The save folder Oblivion.ini points at (SLocalSavePath). Save profiles from mod managers change it."""
+    try:
+        for line in (home / 'Oblivion.ini').read_text('cp1252', 'replace').splitlines():
+            key, _, value = line.partition('=')
+            if key.strip().lower() == 'slocalsavepath':
+                value = value.split(';')[0].strip().strip('"')
+                d = home / value if value else None
+                return d if d is not None and d.is_dir() else None
+    except OSError:
+        pass
+    return None
 
 
 def steam_rem_dir() -> Path:
@@ -132,7 +150,7 @@ class SaveEntry:
 # ----------------------------------------------------------------------------- original Oblivion
 def _bz(r: Reader) -> str:
     n = r.u8()
-    return r.bytes(n)[:max(0, n - 1)].decode('cp1252', 'replace')
+    return decode_text(r.bytes(n)[:max(0, n - 1)])
 
 
 def _og_header(head: bytes):
@@ -435,11 +453,38 @@ def _backup(src: Path, label: str) -> Path:
     return zpath
 
 
-def _newest_rem(store: str, wgs_name: Optional[str] = None) -> Optional[SaveEntry]:
+FACE_NOTE = ("The face may look off: no Remastered character of the same race and sex was found. "
+             "Make one in Remastered, then convert again.")
+
+
+def _template_for(ess: bytes, store: str, wgs_name: Optional[str] = None) -> tuple:
+    """(save to build on, face fits). The new save borrows that save's Remastered face, and a face is made
+    for one race and sex. So: the newest save of a character with the same race and sex, else the same race,
+    else simply the newest save."""
+    try:
+        want = player_look(parse_ess(ess))
+    except Exception:
+        want = None
+    newest = same_race = None
+    seen = set()
     for s in list_remastered():
-        if s.store == store and (wgs_name is None or s.id.split(':')[1] == wgs_name):
-            return s
-    return None
+        if s.store != store or (wgs_name is not None and s.id.split(':')[1] != wgs_name):
+            continue
+        newest = newest or s
+        if want is None:
+            break
+        if s.character_key in seen:         # one look per character: its newest save
+            continue
+        seen.add(s.character_key)
+        try:
+            look = player_look(parse_ess(open_save(_rem_bytes(s.id)).ess))
+        except Exception:
+            continue
+        if look == want:
+            return s, True
+        if look is not None and look[0] == want[0]:
+            same_race = same_race or s
+    return same_race or newest, False
 
 
 def remastered_targets() -> list:
@@ -483,7 +528,7 @@ def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
     if target.startswith('xbox:'):
         wgs_name = target.split(':', 1)[1]
         wgs = next((w for w in xbox_dirs() if w.name == wgs_name), None)
-        tmpl = _newest_rem('xbox', wgs_name)
+        tmpl, fits = _template_for(ess, 'xbox', wgs_name)
         if wgs is None or tmpl is None:
             raise UserError('Save once in Oblivion Remastered first, so there is a save to copy settings from.')
         names = {e.name for e in xgp_write.read_index(wgs / 'containers.index').entries}
@@ -494,11 +539,12 @@ def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
         except xgp_write.ImportError_ as e:
             raise UserError(str(e))
         return {'id': f'xbox:{wgs_name}:{name}', 'title': f'Save {n}', 'container': name, 'backup': str(backup),
-                'where': 'Oblivion Remastered > Load > ' + display_name(open_save(sav))}
+                'where': 'Oblivion Remastered > Load > ' + display_name(open_save(sav)),
+                'note': None if fits else FACE_NOTE}
 
     # Steam: the save is a plain file named after its slot, listed in saves_meta.sav
     sd = steam_rem_dir()
-    tmpl = _newest_rem('steam')
+    tmpl, fits = _template_for(ess, 'steam')
     if tmpl is None:
         raise UserError('Save once in Oblivion Remastered first, so there is a save to copy settings from.')
     sav, details, slot, n = build(_rem_bytes(tmpl.id), lambda s: (sd / (_safe_filename(s) + '.sav')).exists())
@@ -522,4 +568,5 @@ def to_remastered(entry_id: str, target: Optional[str] = None) -> dict:
                 pass
             raise
     return {'id': 'steam:' + path.name, 'title': f'Save {n}', 'path': str(path),
-            'backup': str(backup) if backup else None, 'where': 'Oblivion Remastered > Load'}
+            'backup': str(backup) if backup else None, 'where': 'Oblivion Remastered > Load',
+            'note': None if fits else FACE_NOTE}

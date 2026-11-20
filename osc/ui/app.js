@@ -118,7 +118,7 @@
   // ------------------------------------------------------------ a short message at the bottom
   const noteEl = $('#note');
   let noteT = 0;
-  function say(text, bad) {
+  function say(text, bad, long) {
     noteEl.textContent = text;
     noteEl.classList.toggle('bad', !!bad);
     noteEl.hidden = false;
@@ -126,7 +126,7 @@
     void noteEl.offsetWidth;
     noteEl.classList.remove('off');
     clearTimeout(noteT);
-    noteT = setTimeout(hush, bad ? 10000 : 6500);
+    noteT = setTimeout(hush, bad ? 10000 : long ? 16000 : 6500);
   }
   function hush() { clearTimeout(noteT); noteEl.classList.add('off'); }
   noteEl.addEventListener('click', hush);
@@ -444,7 +444,8 @@
     go.classList.remove('working');
     Fire.idle();
     goText('Done');
-    say(`${ns.title} is ready. Load it in ${GAME[to]}.`);
+    if (res.note) say(`${ns.title} is ready. ${res.note}`, false, true);
+    else say(`${ns.title} is ready. Load it in ${GAME[to]}.`);
     await wait(1500);
     goText('Convert');
     state.busy = false;

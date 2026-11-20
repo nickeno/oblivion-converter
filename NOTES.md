@@ -89,3 +89,15 @@ Writing saves needs no compressor at all (stored Kraken blocks).
 - A save converted to the original game is stamped with the current time, so it lists as the newest.
 - The gate sign and fire canvas are children of the Convert button's wrapper and are sized from the button's own
   box. Do not go back to placing them from screen coordinates (they drifted during the load animation).
+
+## Faces and race (2026-11-20)
+
+- The UE side of a `.sav` has a `Phenotype` item for the player. Its `FaceBaseMesh` is made for one race and sex,
+  like `/Game/Art/Character/Khajiit/SK_Khajiit_Head_m`. OG -> Remastered keeps the template's `Phenotype`, so the
+  template has to be a character with the same race and sex (`library._template_for`).
+- Race and sex are read from the player's change record (form 0x14), right before the name: race, hair, eyes
+  (4 bytes each, indexes into the save's form id list), hair length (4), hair colour (4), sex (1), then the name.
+  `ess.player_look`. Checked on 62 OG saves and 20 Remastered saves.
+- A real Remastered save has the text key (`UI_UserInputText_...`) as the name in that record. A converted save
+  still has the old plain name there, so it is never trusted as a face template.
+- Not tested in the game: what a wrong-race `Phenotype` looks like, and whether dropping it is safe.

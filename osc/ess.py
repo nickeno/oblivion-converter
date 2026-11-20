@@ -3,9 +3,34 @@
 Layout per https://en.uesp.net/wiki/Oblivion_Mod:Save_File_Format; structure of the 0.127 variant
 cross-checked with ORSE's src/shared/ess.ts (MIT).
 """
+import codecs
 from dataclasses import dataclass, field
+from typing import Optional
 
 from .binio import Reader, Writer
+
+PLAYER_REF = 0x14            # the player's own change record
+_CP1252_HOLES = (0x81, 0x8D, 0x8F, 0x90, 0x9D)      # bytes cp1252 has no letter for
+
+
+def _keep_holes(err):
+    """Those five bytes survive a read and write unchanged (saves from non-western game versions have them)."""
+    if isinstance(err, UnicodeDecodeError):
+        return ''.join(map(chr, err.object[err.start:err.end])), err.end
+    if isinstance(err, UnicodeEncodeError):
+        return bytes(ord(c) if ord(c) in _CP1252_HOLES else 0x3F for c in err.object[err.start:err.end]), err.end
+    raise err
+
+
+codecs.register_error('osc_keep', _keep_holes)
+
+
+def decode_text(b: bytes) -> str:
+    return b.decode('cp1252', 'osc_keep')
+
+
+def encode_text(s: str) -> bytes:
+    return s.encode('cp1252', 'osc_keep')
 
 
 class EssError(Exception):
@@ -64,20 +89,20 @@ class Ess:
 def _bz(r: Reader) -> str:
     n = r.u8()
     b = r.bytes(n)
-    return b[:max(0, n - 1)].decode('cp1252', 'replace')
+    return decode_text(b[:max(0, n - 1)])
 
 
 def _bs(r: Reader) -> str:
-    return r.bytes(r.u8()).decode('cp1252', 'replace')
+    return decode_text(r.bytes(r.u8()))
 
 
 def _wbz(w: Writer, s: str):
-    b = s.encode('cp1252', 'replace')
+    b = encode_text(s)
     w.u8(len(b) + 1); w.bytes(b); w.u8(0)
 
 
 def _wbs(w: Writer, s: str):
-    b = s.encode('cp1252', 'replace')
+    b = encode_text(s)
     w.u8(len(b)); w.bytes(b)
 
 
@@ -141,6 +166,31 @@ def parse_ess(d: bytes) -> Ess:
                pc_cell, pc_pos, globals_, tes_class_size, death_counts, game_mode_seconds, processes,
                spec_event, weather, player_combat_count, created, quick_keys, reticule, interface_data,
                regions, records, temp_effects, form_ids, world_spaces, d[r.pos:])
+
+
+def player_look(e: Ess) -> Optional[tuple]:
+    """(race, sex) of the player, or None when it can't be read. Race is (plugin, form id) so it compares
+    across saves; sex is 0 male, 1 female.
+
+    The player's record ends with: race, hair, eyes (4 bytes each), hair length (4), hair colour (4), sex (1),
+    then the name. https://en.uesp.net/wiki/Oblivion_Mod:Save_File_Format/Player_Data
+    A converted save still has the old name there instead of Remastered's text key, so it reads as None:
+    its face came from another character and says nothing about its own race.
+    """
+    rec = next((r for r in e.records if r.form_id == PLAYER_REF), None)
+    if rec is None:
+        return None
+    name = encode_text(e.pc_name)
+    at = rec.data.rfind(bytes([(len(name) + 1) & 0xFF]) + name + b'\0')
+    if at < 21:
+        return None
+    sex = rec.data[at - 1]
+    iref = int.from_bytes(rec.data[at - 21:at - 17], 'little')
+    if sex > 1 or iref >= len(e.form_ids):
+        return None
+    form = e.form_ids[iref]
+    plugin = e.plugins[form >> 24].lower() if (form >> 24) < len(e.plugins) else str(form >> 24)
+    return (plugin, form & 0xFFFFFF), sex
 
 
 def serialize_ess(e: Ess, keep_padding: bool = True) -> bytes:
