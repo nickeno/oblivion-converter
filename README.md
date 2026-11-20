@@ -6,7 +6,7 @@ Move a save between the original Oblivion (2006) and Oblivion Remastered. It wor
 
 ## Use it
 
-1. Download `NickenosOblivionConverter.exe` from Releases and open it.
+1. Download `NickenosOblivionConverter.exe` from [Releases](https://github.com/nickeno/oblivion-converter/releases/latest) and open it.
 2. Pick a save on either side.
 3. Press Convert, or drag the save to the other side.
 4. Open Load in the other game.
