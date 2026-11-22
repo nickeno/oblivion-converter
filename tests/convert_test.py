@@ -397,6 +397,37 @@ def remastered_extras_are_cut_for_og():
                 assert convert.strip_altar_extras(r.data) == r.data, f'{r.form_id:08X} still has the pair'
 
 
+def _motion_block(junk: bytes, flags: int = 0x06, end: float = 1.0) -> bytes:
+    spot = bytes(range(1, 13)) if flags & 8 else b''          # a position, only with flag 8
+    body = bytes(9) + bytes([flags]) + bytes(2) + spot + junk + bytes(12) + struct.pack('<f', end)
+    return b'\xff' + struct.pack('<H', len(body)) + body
+
+
+@test
+def remastered_motion_leftovers_are_zeroed_for_og():
+    # two pointers, a vector, four zero bytes, then the two clock readings from the save that loaded black
+    junk = (bytes.fromhex('00569bfaa1010000 40569bfaa1010000 839a0dc1492ef642ad009042') + bytes(4)
+            + bytes.fromhex('b9bcfd0724110000 23b2c06ea1010000'))
+    head, tail = b'\x01\x00' + bytes(13), bytes.fromhex('8c1c0000') + b'\x01' + bytes(20)
+    for flags in (0x06, 0x0e):
+        got = convert.reset_actor_motion(head + _motion_block(junk, flags) + tail)
+        assert got == head + _motion_block(bytes(48), flags) + tail, f'flags {flags:02x}'
+        assert convert.reset_actor_motion(got) == got
+    other = head + _motion_block(junk, end=0.5) + tail          # not this block: it doesn't end in 1.0
+    assert convert.reset_actor_motion(other) == other
+    _, wgs, og, _ = fresh()
+    for rem in [s for s in library.list_remastered() if s.title.startswith('Save')][:3]:
+        e = parse_ess(Path(library.to_og(rem.id)['path']).read_bytes())
+        player = next(r for r in e.records if r.form_id == 0x14)
+        assert player.type in convert.ACTOR_TYPES
+        ends = list(convert.motion_blocks(player.data))
+        assert len(ends) == 1, f'{rem.title}: {len(ends)} movement blocks in the player record'
+        for r in e.records:
+            if r.type in convert.ACTOR_TYPES:
+                for end in convert.motion_blocks(r.data):
+                    assert not any(r.data[end - 64:end - 16]), f'{rem.title}: {r.form_id:08X} keeps leftovers'
+
+
 @test
 def stale_original_id_is_refused():
     root, _, og, _ = fresh()

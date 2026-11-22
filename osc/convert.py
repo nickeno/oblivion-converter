@@ -37,6 +37,19 @@ ALTAR_EXTRAS_LEN = 1 + 16 + 1 + 128
 _ALTAR_TEXT = re.compile(rb'[\x20-\x7e]*\x00')
 
 
+# An actor the game was moving when it saved (the player always is) has a block in its change record: 0xFF, a
+# 2-byte size (76, or 88 with a position in it), then that many bytes ending in the float 1.0. The original game
+# keeps movement floats in it. Remastered leaves whatever was in memory in 48 of those bytes: two 64-bit pointers,
+# an old vector and two readings of the PC's clock, the same two in every actor of a save. The original game reads
+# them as floats; a PC that has been on for three weeks has a clock reading like 0x6EC0B223, which is 3e28 as a
+# float. The player's position came out as NaN and the world wasn't drawn (black screen with only the HUD).
+# The original game's own saves have zeros there for a player standing still, so the 48 bytes are zeroed.
+ACTOR_TYPES = (50, 51)
+MOTION_SIZES = range(76, 129)
+MOTION_JUNK = 48            # ends 16 bytes before the end of the block
+_ONE = struct.pack('<f', 1.0)
+
+
 class ConvertError(Exception):
     """The save can't be converted; the message says why in plain words."""
 
@@ -123,6 +136,28 @@ def strip_altar_extras(data: bytes) -> bytes:
     return bytes(out + data[start:]) if start else data
 
 
+def motion_blocks(data: bytes):
+    """Where each movement block of an actor's change record ends (see MOTION_SIZES above)."""
+    i = data.find(b'\xff')
+    while 0 <= i and i + 3 + MOTION_SIZES[0] <= len(data):
+        end = i + 3 + int.from_bytes(data[i + 1:i + 3], 'little')
+        if (end - i - 3 in MOTION_SIZES and end <= len(data) and data[end - 4:end] == _ONE
+                and not any(data[i + 3:i + 7]) and not any(data[end - 16:end - 4])
+                and not any(data[end - 36:end - 32])):
+            yield end
+            i = end - 1
+        i = data.find(b'\xff', i + 1)
+
+
+def reset_actor_motion(data: bytes) -> bytes:
+    """An actor's change record with Remastered's leftover memory in its movement block zeroed."""
+    for end in motion_blocks(data):
+        a = end - 16 - MOTION_JUNK
+        if any(data[a:end - 16]):
+            data = data[:a] + bytes(MOTION_JUNK) + data[end - 16:]
+    return data
+
+
 def display_name(save: RemasteredSave) -> str:
     return text_prop_string(save.detail('DisplayPlayerName')) or ''
 
@@ -148,6 +183,8 @@ def remastered_to_og(sav_bytes: bytes, save_num: Optional[int] = None) -> bytes:
         rec.version = OG_VERSION
         if rec.type in REF_TYPES and rec.flags & 0x20:
             rec.data = strip_altar_extras(rec.data)
+        if rec.type in ACTOR_TYPES:
+            rec.data = reset_actor_motion(rec.data)
     e.padding = b''
     return serialize_ess(e)
 

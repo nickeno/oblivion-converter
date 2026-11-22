@@ -80,6 +80,23 @@ Writing saves needs no compressor at all (stored Kraken blocks).
   (records 49-51, flag 0x20). OG only knows types up to 0x5C and skips unknown ones as one byte, so it read the
   payload as more entries. Fix: `strip_altar_extras` cuts the payloads, keeps the two type bytes (count stays
   right). Level 4 and level 12 saves then loaded in OG with the right name, race, class, level and gear.
+- Remastered -> OG loaded to a black screen with only the HUD for a level 14 save (2026-11-23, 0.1.3). In the
+  console `player.getpos x` gave `-1.#J` (NaN), angle and scale were fine. Keeping only the player's two records
+  (forms 7 and 14) was still black, so it is in the player's own record. Cause: actors the game was moving when it
+  saved (the player always) have a block after their properties: a list (2-byte count, 13-byte entries), 0xFF, a
+  2-byte size, then the block (76 bytes, 88 with flag 8 at byte 9, which adds a position). From its end backwards:
+  float 1.0, 12 zero bytes, 16 bytes, 4 zero bytes, 12 bytes, 16 bytes. OG keeps movement floats in those 16+12+16
+  (zero for a player standing still). Remastered leaves memory there: two 64-bit pointers, an old vector, and two
+  clock readings that are the same in every actor of a save (a 64-bit counter and the 32-bit uptime in ms). The
+  uptime was 0x6EC0B223 (21 days, Fast Startup keeps it counting), which is 3e28 as a float. Saves made at
+  0x45459290 (3161.0 as a float) loaded fine, which is why the level 4 and 12 saves worked. Zeroing only the
+  uptime, or only the pointers and the vector, was each enough; `reset_actor_motion` zeroes all 48 bytes in every
+  type 50/51 record. Tested in OG by loading the level 14 save (Umbacano Manor) with each variant.
+- The "quest added" popups on first load are OG's own DLC quests (Horse Armor, Frostcrag, Razor, ...). Remastered
+  hasn't started them in the save, OG starts them all at once. Same as a new OG character with the DLCs on.
+- Driving OG for tests: scratchpad `runtest.py` set `SLocalSavePath=SavesOSC\` and blank intro movies in
+  Oblivion.ini (backup in `backups/`), put one save in that folder, clicked Play in the launcher with PostMessage
+  and Continue in the menu with SendInput. Black screen shows as 34% (behind a popup) or 100% near-black pixels.
 - Claude desktop sandbox: new files written to %LOCALAPPDATA% from Claude's shell are hidden from Windows, so the
   wgs writes were run via a WMI-spawned process (Win32_Process.Create). Normal users running the tool don't hit this.
 - Both test saves were removed afterwards; all remaining Game Pass saves were byte-identical to the backup in
