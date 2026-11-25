@@ -11,7 +11,7 @@ python -m venv .venv
 
 `requirements.txt` pins the exact versions the released .exe is built with.
 
-Make the single .exe:
+Make the zip (it lands in `dist`):
 
 ```
 .venv\Scripts\python packaging\build.py

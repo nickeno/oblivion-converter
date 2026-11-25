@@ -9,7 +9,7 @@
 | Nunito font, by Vernon Adams and the Nunito project authors | `osc/ui/assets/nunito.woff2` | SIL Open Font License 1.1 |
 | Game logos and artwork (the two Oblivion logos, the stone wall, the gate sign and its fire) | `osc/ui/assets/`, `packaging/app.ico` | Property of Bethesda Softworks / ZeniMax Media. Not covered by this project's license. |
 
-## Packed into the .exe
+## Shipped in the zip
 
 | What | License |
 | --- | --- |

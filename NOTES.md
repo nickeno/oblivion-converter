@@ -111,7 +111,13 @@ Writing saves needs no compressor at all (stored Kraken blocks).
   the address to open, `/?dev=<token>`; the token is new every start and the API refuses calls without it.
 - Converts take a named Windows mutex, so two app windows or the app and the command line never write at once.
 - `tests/convert_test.py --wgs <profile> --og <.ess>` checks converting and adding saves on copies.
-- `dist\NickenosOblivionConverter.exe --selftest out.json` opens, writes what the screen shows, and closes.
+- `dist\NickenosOblivionConverter\NickenosOblivionConverter.exe --selftest out.json` opens, writes what the screen
+  shows, and closes.
+- Since 0.1.5 the build is a folder in a zip (`--onedir`), not one .exe that unpacks itself (`--onefile`). On
+  VirusTotal the single 0.1.4 .exe got 4 of 71 (Arctic Wolf, Bkav, SecureAge, SentinelOne), the folder build's .exe
+  1 of 70 (Skyhigh). Nexus also locks every bare .exe upload. `build.py` adds file details (name, version) to the
+  .exe and unpacks PyInstaller's `base_library.zip`, because Nexus refuses a zip inside a zip. The app starts fine
+  without that zip: Python finds the same files as loose `.pyc` in `_internal`.
 - Testing never touches the real save folders: point `OSC_OG_SAVES`, `OSC_WGS`, `OSC_STEAM_REM` and `OSC_BACKUPS`
   at copies. With `OSC_WGS` / `OSC_STEAM_REM` set, the "close Remastered first" check is skipped.
 - Original Oblivion keeps saves in `Documents\My Games\Oblivion\Saves` on Steam, GOG and Game Pass alike

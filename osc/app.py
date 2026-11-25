@@ -167,7 +167,8 @@ def _selftest(window, out_path: str):
         fire: !!(window.Fire && window.Fire.ok), bridge: !!(window.pywebview && window.pywebview.api.load) })"""
     try:
         report['ooz'] = str(oodle._find_dll())
-        end = time.time() + 20
+        start = time.time()
+        end = start + 20
         while time.time() < end:
             time.sleep(.5)
             try:
@@ -175,7 +176,9 @@ def _selftest(window, out_path: str):
             except Exception:
                 continue
             report.update(state)
-            if state.get('bridge') and not state.get('looking') and (not state.get('rows') or state.get('pictures')):
+            # an empty list only counts after a few seconds: a cold start can be read before the page drew anything
+            settled = state.get('pictures') or (not state.get('rows') and time.time() - start > 5)
+            if state.get('bridge') and not state.get('looking') and settled:
                 report['ok'] = bool(state.get('fire'))
                 break
     except Exception:
